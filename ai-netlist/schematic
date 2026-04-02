@@ -1,0 +1,202 @@
+graph LR
+    classDef net fill:#e1f5fe,stroke:#01579b,stroke-width:2px,color:#000;
+    classDef comp fill:#fff3e0,stroke:#e65100,stroke-width:2px,color:#000;
+    classDef gnd fill:#e8f5e9,stroke:#1b5e20,stroke-width:2px,color:#000;
+
+    %% ================= NETS =================
+    3V3_IN([3V3_IN]):::net
+    3V3A([3V3A]):::net
+    DGND([DGND / GND]):::gnd
+    AGND([AGND]):::gnd
+    VEXC_2V5([VEXC_2V5]):::net
+    VMID_RAW([VMID_RAW]):::net
+    VMID_AINN_BUF([VMID_AINN_BUF]):::net
+    VREF_1V25_BUF([VREF_1V25_BUF]):::net
+    ADC_CLKIN([ADC_CLKIN]):::net
+    OSC_8M192([OSC_8M192]):::net
+    ESP_ADC_MCLK([ESP_ADC_MCLK]):::net
+
+    %% ================= POWER & GROUNDS =================
+    J1[J1: ESP32 Header]:::comp
+    J1 -- "pin_3V3" --> 3V3_IN
+    J1 -- "pin_GND" --> DGND
+
+    FB1[FB1: Ferrite]:::comp
+    3V3_IN --- FB1 --- 3V3A
+
+    NT1[NT1: Net Tie]:::comp
+    AGND --- NT1 --- DGND
+
+    C1[C1: 10uF]:::comp
+    3V3A --- C1 --- AGND
+
+    C2[C2: 100nF]:::comp
+    3V3A --- C2 --- AGND
+
+    C3[C3: 100nF]:::comp
+    3V3_IN --- C3 --- DGND
+
+    %% ================= REFERENCE GENERATION =================
+    U3[U3: REF3125]:::comp
+    3V3A -- "IN" --> U3
+    U3 -- "GND" --> AGND
+    U3 -- "OUT" --> VEXC_2V5
+
+    C8[C8: 100nF]:::comp
+    3V3A --- C8 --- AGND
+
+    R4[R4: 10k]:::comp
+    VEXC_2V5 --- R4 --- VMID_RAW
+
+    R5[R5: 10k]:::comp
+    VMID_RAW --- R5 --- AGND
+
+    U4[U4: OPA2333]:::comp
+    3V3A -- "V+" --> U4
+    U4 -- "V-" --> AGND
+    VMID_RAW -- "+IN_A" --> U4
+    U4 -- "-IN_A / OUT_A" --> VMID_AINN_BUF
+    VMID_RAW -- "+IN_B" --> U4
+    U4 -- "-IN_B / OUT_B" --> VREF_1V25_BUF
+
+    C9[C9: 100nF]:::comp
+    3V3A --- C9 --- AGND
+
+    %% ================= CLOCK SOURCE =================
+    U2[U2: SiT8924]:::comp
+    3V3_IN -- "VDD / OE" --> U2
+    U2 -- "GND" --> DGND
+    U2 -- "OUT" --> OSC_8M192
+
+    C7[C7: 100nF]:::comp
+    3V3_IN --- C7 --- DGND
+
+    R2[R2: 33R]:::comp
+    OSC_8M192 --- R2 --- ADC_CLKIN
+
+    R3[R3: DNP 0R]:::comp
+    ESP_ADC_MCLK --- R3 --- ADC_CLKIN
+    J1 -- "GPIO_c" --> ESP_ADC_MCLK
+
+    %% ================= SENSOR CONNECTOR =================
+    J2[J2: Sensor Conn]:::comp
+    VEXC_2V5 -- "VEXC+" --> J2
+    AGND -- "VEXC-" --> J2
+    J2 -- "shield" --> CHASSIS([CHASSIS]):::gnd
+
+    C10[C10: 1uF]:::comp
+    VEXC_2V5 --- C10 --- AGND
+    C11[C11: 100nF]:::comp
+    VEXC_2V5 --- C11 --- AGND
+
+    %% ================= DIGITAL SPI & CONTROL =================
+    ESP_ADC_CS([ESP_ADC_CS]):::net
+    ESP_ADC_SCLK([ESP_ADC_SCLK]):::net
+    ESP_ADC_MOSI([ESP_ADC_MOSI]):::net
+    ESP_ADC_MISO([ESP_ADC_MISO]):::net
+    ESP_ADC_DRDY([ESP_ADC_DRDY]):::net
+    ESP_ADC_SYNC_RESET([ESP_ADC_SYNC_RESET]):::net
+
+    J1 -- "GPIO_x" --> ESP_ADC_CS
+    J1 -- "GPIO_y" --> ESP_ADC_SCLK
+    J1 -- "GPIO_z" --> ESP_ADC_MOSI
+    J1 -- "GPIO_w" --> ESP_ADC_MISO
+    J1 -- "GPIO_a" --> ESP_ADC_DRDY
+    J1 -- "GPIO_b" --> ESP_ADC_SYNC_RESET
+
+    R1[R1: 10k PU]:::comp
+    3V3_IN --- R1 --- ESP_ADC_SYNC_RESET
+
+    %% ================= ADC CORE =================
+    U1[U1: ADS131M08]:::comp
+    3V3A -- "AVDD" --> U1
+    AGND -- "AGND / THERMAL" --> U1
+    3V3_IN -- "DVDD" --> U1
+    DGND -- "DGND" --> U1
+    U1 -- "CAP" --> U1_CAP([U1_CAP]):::net
+    VREF_1V25_BUF -- "REFIN" --> U1
+    ADC_CLKIN -- "XTAL1_CLKIN" --> U1
+
+    ESP_ADC_CS -- "CS" --> U1
+    ESP_ADC_SCLK -- "SCLK" --> U1
+    ESP_ADC_MOSI -- "DIN" --> U1
+    U1 -- "DOUT" --> ESP_ADC_MISO
+    U1 -- "DRDY" --> ESP_ADC_DRDY
+    ESP_ADC_SYNC_RESET -- "SYNC_RESET" --> U1
+
+    C4[C4: 1uF]:::comp
+    3V3A --- C4 --- AGND
+    C5[C5: 1uF]:::comp
+    3V3_IN --- C5 --- DGND
+    C6[C6: 220nF]:::comp
+    U1_CAP --- C6 --- DGND
+
+    %% ================= FILTERS & ADC INPUTS =================
+    %% CH0
+    J2 -- "G0" --> FT_G0([FT_G0]):::net
+    R10[R10: 1k]:::comp
+    FT_G0 --- R10 --- AIN0P_FILT([AIN0P_FILT]):::net
+    R11[R11: 1k]:::comp
+    VMID_AINN_BUF --- R11 --- AIN0N_FILT([AIN0N_FILT]):::net
+    C20[C20: 10nF]:::comp
+    AIN0P_FILT --- C20 --- AIN0N_FILT
+    AIN0P_FILT -- "AIN0P" --> U1
+    AIN0N_FILT -- "AIN0N" --> U1
+
+    %% CH1
+    J2 -- "G1" --> FT_G1([FT_G1]):::net
+    R12[R12: 1k]:::comp
+    FT_G1 --- R12 --- AIN1P_FILT([AIN1P_FILT]):::net
+    R13[R13: 1k]:::comp
+    VMID_AINN_BUF --- R13 --- AIN1N_FILT([AIN1N_FILT]):::net
+    C21[C21: 10nF]:::comp
+    AIN1P_FILT --- C21 --- AIN1N_FILT
+    AIN1P_FILT -- "AIN1P" --> U1
+    AIN1N_FILT -- "AIN1N" --> U1
+
+    %% CH2
+    J2 -- "G2" --> FT_G2([FT_G2]):::net
+    R14[R14: 1k]:::comp
+    FT_G2 --- R14 --- AIN2P_FILT([AIN2P_FILT]):::net
+    R15[R15: 1k]:::comp
+    VMID_AINN_BUF --- R15 --- AIN2N_FILT([AIN2N_FILT]):::net
+    C22[C22: 10nF]:::comp
+    AIN2P_FILT --- C22 --- AIN2N_FILT
+    AIN2P_FILT -- "AIN2P" --> U1
+    AIN2N_FILT -- "AIN2N" --> U1
+
+    %% CH3
+    J2 -- "G3" --> FT_G3([FT_G3]):::net
+    R16[R16: 1k]:::comp
+    FT_G3 --- R16 --- AIN3P_FILT([AIN3P_FILT]):::net
+    R17[R17: 1k]:::comp
+    VMID_AINN_BUF --- R17 --- AIN3N_FILT([AIN3N_FILT]):::net
+    C23[C23: 10nF]:::comp
+    AIN3P_FILT --- C23 --- AIN3N_FILT
+    AIN3P_FILT -- "AIN3P" --> U1
+    AIN3N_FILT -- "AIN3N" --> U1
+
+    %% CH4
+    J2 -- "G4" --> FT_G4([FT_G4]):::net
+    R18[R18: 1k]:::comp
+    FT_G4 --- R18 --- AIN4P_FILT([AIN4P_FILT]):::net
+    R19[R19: 1k]:::comp
+    VMID_AINN_BUF --- R19 --- AIN4N_FILT([AIN4N_FILT]):::net
+    C24[C24: 10nF]:::comp
+    AIN4P_FILT --- C24 --- AIN4N_FILT
+    AIN4P_FILT -- "AIN4P" --> U1
+    AIN4N_FILT -- "AIN4N" --> U1
+
+    %% CH5
+    J2 -- "G5" --> FT_G5([FT_G5]):::net
+    R20[R20: 1k]:::comp
+    FT_G5 --- R20 --- AIN5P_FILT([AIN5P_FILT]):::net
+    R21[R21: 1k]:::comp
+    VMID_AINN_BUF --- R21 --- AIN5N_FILT([AIN5N_FILT]):::net
+    C25[C25: 10nF]:::comp
+    AIN5P_FILT --- C25 --- AIN5N_FILT
+    AIN5P_FILT -- "AIN5P" --> U1
+    AIN5N_FILT -- "AIN5N" --> U1
+
+    %% UNUSED CHANNELS
+    AGND -- "AIN6P/N, AIN7P/N" --> U1

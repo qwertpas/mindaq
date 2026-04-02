@@ -1,0 +1,210 @@
+========================
+POWER / GROUNDS
+========================
+
+J1  ESP32S3_SUPERMINI_HEADER
+  pin_3V3   -> 3V3_IN
+  pin_GND   -> GND
+
+FB1  ferrite_bead_or_0R
+  3V3_IN -> 3V3A
+  # optional but recommended; 0R is acceptable for rev A
+
+NT1  net_tie
+  AGND <-> DGND
+  # place at/under ADC ground area
+
+C1   10uF   3V3A  AGND
+C2   100nF  3V3A  AGND
+C3   100nF  3V3_IN DGND
+
+
+========================
+ADC
+========================
+
+U1  ADS131M08   # choose TQFP or WQFN package you prefer
+
+U1.AVDD         -> 3V3A
+U1.AGND         -> AGND
+U1.DVDD         -> 3V3_IN
+U1.DGND         -> DGND
+U1.CAP          -> U1_CAP
+U1.REFIN        -> VREF_1V25_BUF
+U1.XTAL1_CLKIN  -> ADC_CLKIN
+U1.XTAL2        -> NC
+U1.CS           -> ESP_ADC_CS
+U1.SCLK         -> ESP_ADC_SCLK
+U1.DIN          -> ESP_ADC_MOSI
+U1.DOUT         -> ESP_ADC_MISO
+U1.DRDY         -> ESP_ADC_DRDY
+U1.SYNC_RESET   -> ESP_ADC_SYNC_RESET
+U1.THERMAL_PAD  -> AGND
+
+C4   1uF    U1.AVDD   AGND
+C5   1uF    U1.DVDD   DGND
+C6   220nF  U1_CAP    DGND
+
+R1   10k    U1.SYNC_RESET  3V3_IN
+  # pull-up so ADC starts even if MCU pin floats at boot
+
+
+========================
+CLOCK SOURCE (RECOMMENDED DEFAULT: EXTERNAL OSCILLATOR)
+========================
+
+U2  SiTime_SiT8924BA-22-33E-8.192000
+  VDD   -> 3V3_IN
+  GND   -> DGND
+  OUT   -> OSC_8M192
+  OE/ST -> 3V3_IN    # if the selected variant has OE; otherwise leave per datasheet
+
+C7   100nF  U2.VDD   DGND
+
+R2   33R    OSC_8M192   ADC_CLKIN
+  # populate for external oscillator path
+
+R3   DNP_0R ESP_ADC_MCLK  ADC_CLKIN
+  # alternate path if you later want ESP-generated MCLK instead of oscillator
+
+# Only populate one clock path:
+#   external oscillator: populate R2, DNP R3
+#   MCU clock: DNP U2/R2, populate R3
+
+
+========================
+2.5 V EXCITATION / 1.25 V MIDPOINT / 1.25 V ADC REFERENCE
+========================
+
+U3  REF3125AIDBZT
+  IN   -> 3V3A
+  GND  -> AGND
+  OUT  -> VEXC_2V5
+
+C8   100nF  U3.IN   AGND
+# REF3125 does not require an output/load capacitor
+
+R4   10k_0p1   VEXC_2V5   VMID_RAW
+R5   10k_0p1   VMID_RAW   AGND
+
+U4  OPA2333AIDGKR
+  V+    -> 3V3A
+  V-    -> AGND
+
+C9   100nF  U4.V+  AGND
+
+# Channel A buffers 1.25 V for all AINxN sources
+U4A.+IN  -> VMID_RAW
+U4A.-IN  -> VMID_AINN_BUF
+U4A.OUT  -> VMID_AINN_BUF
+
+# Channel B buffers 1.25 V for ADC external reference
+U4B.+IN  -> VMID_RAW
+U4B.-IN  -> VREF_1V25_BUF
+U4B.OUT  -> VREF_1V25_BUF
+
+# No capacitor on REFIN in this minimal rev
+# (especially important if current-detect mode were ever used)
+
+
+========================
+SENSOR CONNECTOR
+========================
+
+J2  FT_SENSOR_CONNECTOR
+  VEXC+  -> VEXC_2V5
+  VEXC-  -> AGND
+  G0     -> FT_G0
+  G1     -> FT_G1
+  G2     -> FT_G2
+  G3     -> FT_G3
+  G4     -> FT_G4
+  G5     -> FT_G5
+  shield -> CHASSIS_OR_GND_OPTIONAL
+
+C10  1uF    VEXC_2V5  AGND
+C11  100nF  VEXC_2V5  AGND
+  # place near sensor connector on the PCB
+
+
+========================
+ANALOG INPUT FILTERS (6 USED CHANNELS)
+TI recommended per-channel RC:
+  1k in series with P
+  1k in series with N
+  10nF differential at ADC pins
+========================
+
+# CH0
+R10  1k   FT_G0         AIN0P_FILT
+R11  1k   VMID_AINN_BUF AIN0N_FILT
+C20  10nF AIN0P_FILT    AIN0N_FILT
+U1.AIN0P -> AIN0P_FILT
+U1.AIN0N -> AIN0N_FILT
+
+# CH1
+R12  1k   FT_G1         AIN1P_FILT
+R13  1k   VMID_AINN_BUF AIN1N_FILT
+C21  10nF AIN1P_FILT    AIN1N_FILT
+U1.AIN1P -> AIN1P_FILT
+U1.AIN1N -> AIN1N_FILT
+
+# CH2
+R14  1k   FT_G2         AIN2P_FILT
+R15  1k   VMID_AINN_BUF AIN2N_FILT
+C22  10nF AIN2P_FILT    AIN2N_FILT
+U1.AIN2P -> AIN2P_FILT
+U1.AIN2N -> AIN2N_FILT
+
+# CH3
+R16  1k   FT_G3         AIN3P_FILT
+R17  1k   VMID_AINN_BUF AIN3N_FILT
+C23  10nF AIN3P_FILT    AIN3N_FILT
+U1.AIN3P -> AIN3P_FILT
+U1.AIN3N -> AIN3N_FILT
+
+# CH4
+R18  1k   FT_G4         AIN4P_FILT
+R19  1k   VMID_AINN_BUF AIN4N_FILT
+C24  10nF AIN4P_FILT    AIN4N_FILT
+U1.AIN4P -> AIN4P_FILT
+U1.AIN4N -> AIN4N_FILT
+
+# CH5
+R20  1k   FT_G5         AIN5P_FILT
+R21  1k   VMID_AINN_BUF AIN5N_FILT
+C25  10nF AIN5P_FILT    AIN5N_FILT
+U1.AIN5P -> AIN5P_FILT
+U1.AIN5N -> AIN5N_FILT
+
+
+========================
+UNUSED ADC CHANNELS
+========================
+
+U1.AIN6P -> AGND
+U1.AIN6N -> AGND
+U1.AIN7P -> AGND
+U1.AIN7N -> AGND
+
+# or use 0R links if you want easy rework:
+R30 0R AIN6P_FILT AGND
+R31 0R AIN6N_FILT AGND
+R32 0R AIN7P_FILT AGND
+R33 0R AIN7N_FILT AGND
+
+
+========================
+ESP32-S3 DIGITAL NETS
+========================
+
+J1.GPIO_x   -> ESP_ADC_CS
+J1.GPIO_y   -> ESP_ADC_SCLK
+J1.GPIO_z   -> ESP_ADC_MOSI
+J1.GPIO_w   -> ESP_ADC_MISO
+J1.GPIO_a   -> ESP_ADC_DRDY
+J1.GPIO_b   -> ESP_ADC_SYNC_RESET
+J1.GPIO_c   -> ESP_ADC_MCLK   # only used if R3 populated
+
+# keep these short
+# SCLK / MCLK are the most timing-sensitive

@@ -1,0 +1,529 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>minDAQ Schematic — netlist_5025</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+body { background:#0d1117; overflow-x:auto; font-family:monospace; }
+h1 { color:#58a6ff; text-align:center; padding:12px 0 3px; font-size:16px; letter-spacing:1px; }
+.sub { color:#8b949e; text-align:center; font-size:11px; padding-bottom:8px; }
+canvas { display:block; margin:0 auto; cursor:default; }
+</style>
+</head>
+<body>
+<h1>minDAQ · Visual Schematic · netlist_5025</h1>
+<p class="sub">ADS131M08 8-ch ADC · 6-ch Force/Torque · ESP32-S3 SuperMini · REF5025 · OPA2333 · SiTime 8.192 MHz</p>
+<canvas id="sch" width="1800" height="1260"></canvas>
+<script>
+const cv = document.getElementById('sch');
+const g  = cv.getContext('2d');
+const W  = 1800, H = 1260;
+
+// ─── Palette ──────────────────────────────────────────────────────────────────
+const C = {
+  bg:'#0d1117',   grid:'#161b22',
+  dig:'#0d2237',  digB:'#388bfd',
+  adc:'#170d33',  adcB:'#a371f7',
+  ana:'#0b2010',  anaB:'#3fb950',
+  clk:'#291700',  clkB:'#ffa657',
+  sen:'#29200a',  senB:'#e3b341',
+  pas:'#141c25',  pasB:'#505860',
+  txt:'#e6edf3',  dim:'#8b949e',  pin:'#c9d1d9',
+  net:'#ffd700',
+  wp :'#ff7b72',  wg :'#8b949e',
+  wa :'#ffa657',  ws :'#56d364',
+  wc :'#e8b86d',  jnc:'#58a6ff',
+};
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function rr(x,y,w,h,r=4) {
+  g.beginPath();
+  g.moveTo(x+r,y); g.lineTo(x+w-r,y); g.arcTo(x+w,y,x+w,y+r,r);
+  g.lineTo(x+w,y+h-r); g.arcTo(x+w,y+h,x+w-r,y+h,r);
+  g.lineTo(x+r,y+h); g.arcTo(x,y+h,x,y+h-r,r);
+  g.lineTo(x,y+r); g.arcTo(x,y,x+r,y,r);
+  g.closePath();
+}
+
+function ln(x1,y1,x2,y2,col=C.jnc,lw=1.5) {
+  g.beginPath(); g.moveTo(x1,y1); g.lineTo(x2,y2);
+  g.strokeStyle=col; g.lineWidth=lw; g.stroke();
+}
+
+function dot(x,y,r=3,col=C.jnc) {
+  g.beginPath(); g.arc(x,y,r,0,2*Math.PI);
+  g.fillStyle=col; g.fill();
+}
+
+// Net label flag (arrow tag)
+function nf(x,y,label,dir='r',col=C.net) {
+  const cw=label.length*6+10, ch=14;
+  g.fillStyle='#1c1800'; g.strokeStyle=col; g.lineWidth=1;
+  g.beginPath();
+  if(dir==='r'){
+    g.moveTo(x,y-ch/2); g.lineTo(x+cw,y-ch/2);
+    g.lineTo(x+cw+7,y); g.lineTo(x+cw,y+ch/2); g.lineTo(x,y+ch/2);
+  } else {
+    g.moveTo(x,y-ch/2); g.lineTo(x-cw,y-ch/2);
+    g.lineTo(x-cw-7,y); g.lineTo(x-cw,y+ch/2); g.lineTo(x,y+ch/2);
+  }
+  g.closePath(); g.fill(); g.stroke();
+  g.fillStyle=col; g.font='bold 8px monospace';
+  g.textAlign='center';
+  g.fillText(label, x+(dir==='r'?cw/2:-cw/2), y+3);
+}
+
+// Power VCC arrow (upward from x,y)
+function vcc(x,y,label) {
+  const c=C.wp;
+  ln(x,y,x,y-20,c); ln(x-7,y-13,x,y-21,c); ln(x+7,y-13,x,y-21,c);
+  g.fillStyle=c; g.font='bold 8px monospace'; g.textAlign='center';
+  g.fillText(label,x,y-24);
+}
+
+// GND symbol (downward from x,y)
+function gnd(x,y,label='AGND') {
+  const c=C.wg;
+  ln(x,y,x,y+14,c);
+  ln(x-8,y+14,x+8,y+14,c);
+  ln(x-5,y+18,x+5,y+18,c);
+  ln(x-2,y+22,x+2,y+22,c);
+  g.fillStyle=c; g.font='bold 8px monospace'; g.textAlign='center';
+  g.fillText(label,x,y+32);
+}
+
+// Draw a component box: returns {x,y,w,h}
+function box(x,y,w,h,des,val,bg,bd) {
+  g.fillStyle=bg; g.strokeStyle=bd; g.lineWidth=1.5;
+  rr(x,y,w,h); g.fill(); g.stroke();
+  // header tint
+  g.fillStyle=bd+'28'; rr(x,y,w,20); g.fill();
+  g.fillStyle=C.txt; g.font='bold 10px monospace'; g.textAlign='center';
+  g.fillText(des,x+w/2,y+14);
+  if(val) {
+    const lines=val.split('\n');
+    lines.forEach((l,i)=>{
+      g.fillStyle=C.dim; g.font='9px monospace';
+      g.textAlign='center'; g.fillText(l,x+w/2,y+28+i*13);
+    });
+  }
+  return {x,y,w,h};
+}
+
+// Right-side pin: dot + stub + net label
+function rpin(bx,by,bw,dy,name,net,col=C.pin) {
+  const px=bx+bw, py=by+dy;
+  ln(px,py,px+10,py,col,1);
+  dot(px,py,1.5,col);
+  g.fillStyle=col; g.font='8px monospace'; g.textAlign='end';
+  g.fillText(name,px-3,py+3);
+  if(net) nf(px+12,py,net,'r',col);
+}
+
+// Left-side pin: dot + stub, net goes left (only if bx>120)
+function lpin(bx,by,dy,name,net,col=C.pin) {
+  const px=bx, py=by+dy;
+  ln(px-10,py,px,py,col,1);
+  dot(px,py,1.5,col);
+  g.fillStyle=col; g.font='8px monospace'; g.textAlign='start';
+  g.fillText(name,px+3,py+3);
+  if(net) nf(px-12,py,net,'l',col);
+}
+
+// Section background panel
+function section(x,y,w,h,col,label) {
+  g.fillStyle=col+'14'; g.strokeStyle=col+'40'; g.lineWidth=1;
+  rr(x,y,w,h,6); g.fill(); g.stroke();
+  g.fillStyle=col; g.font='bold 10px monospace'; g.textAlign='left';
+  g.fillText(label,x+7,y+14);
+}
+
+// ─── Background ───────────────────────────────────────────────────────────────
+g.fillStyle=C.bg; g.fillRect(0,0,W,H);
+g.strokeStyle=C.grid; g.lineWidth=0.5;
+for(let x=0;x<=W;x+=40){ ln(x,0,x,H,C.grid,0.5); }
+for(let y=0;y<=H;y+=40){ ln(0,y,W,y,C.grid,0.5); }
+
+// ─── Section Panels ───────────────────────────────────────────────────────────
+section(8,  62, 490, 380, C.digB, '⚡ POWER & MCU');
+section(1285,62, 507, 320, C.clkB, '⏱ CLOCK SOURCE');
+section(633, 62, 660, 680, C.adcB, '📊 ADC  ·  ADS131M08');
+section(8,  450, 623, 340, C.anaB, '🎛 REFERENCE & EXCITATION  ·  REF5025 · OPA2333');
+section(8,  798, 305, 325, C.senB, '🔌 SENSOR CONNECTOR');
+section(320,775, 1195,360, '#79c0ff', '🔘 ANALOG INPUT FILTERS  CH0–CH5');
+
+// ─── J1 ESP32-S3 SuperMini Header ────────────────────────────────────────────
+box(14,82,165,315,'J1','ESP32-S3 SuperMini\nHeader',C.dig,C.digB);
+const j1p=[
+  {dy:58, n:'3V3',    net:'3V3_IN', c:C.wp},
+  {dy:80, n:'GND',    net:'DGND',   c:C.wg},
+  {dy:120,n:'GPIO_x', net:'ESP_ADC_CS',         c:C.ws},
+  {dy:142,n:'GPIO_y', net:'ESP_ADC_SCLK',       c:C.ws},
+  {dy:164,n:'GPIO_z', net:'ESP_ADC_MOSI',       c:C.ws},
+  {dy:186,n:'GPIO_w', net:'ESP_ADC_MISO',       c:C.ws},
+  {dy:208,n:'GPIO_a', net:'ESP_ADC_DRDY',       c:C.ws},
+  {dy:230,n:'GPIO_b', net:'ESP_ADC_SYNC_RST',   c:C.ws},
+  {dy:252,n:'GPIO_c', net:'ESP_ADC_MCLK',       c:C.ws},
+];
+j1p.forEach(p=>rpin(14,82,165,p.dy,p.n,p.net,p.c));
+
+// ─── FB1 Ferrite Bead ────────────────────────────────────────────────────────
+box(208,82,115,40,'FB1','3V3_IN → 3V3A\nferrite/0Ω',C.pas,C.pasB);
+nf(208,102,'3V3_IN','l',C.wp);
+nf(325,102,'3V3A','r',C.wp);
+
+// ─── C3, C1, C2 – Power decoupling ──────────────────────────────────────────
+box(208,133,115,40,'C3  100nF','3V3_IN – DGND',C.pas,C.pasB);
+nf(208,153,'3V3_IN','l',C.wp); gnd(265,173,'DGND');
+
+box(208,183,115,40,'C1  10µF', '3V3A – AGND',C.pas,C.pasB);
+nf(208,203,'3V3A','l',C.wp);   gnd(265,223,'AGND');
+
+box(208,233,115,40,'C2  100nF','3V3A – AGND',C.pas,C.pasB);
+nf(208,253,'3V3A','l',C.wp);   gnd(265,273,'AGND');
+
+// ─── NT1 Net Tie ─────────────────────────────────────────────────────────────
+box(208,295,160,40,'NT1','AGND ↔ DGND\n(place at ADC GND area)',C.pas,C.pasB);
+
+// ─── U1 ADS131M08 ADC ────────────────────────────────────────────────────────
+const U1={x:641,y:80,w:312,h:568};
+box(U1.x,U1.y,U1.w,U1.h,'U1  ADS131M08','8-Channel 24-bit Delta-Sigma ADC (SPI)\nTQFP-48 / WQFN-48',C.adc,C.adcB);
+
+const u1L=[
+  {dy:50, n:'AVDD',       net:'3V3A',           c:C.wp},
+  {dy:68, n:'AGND',       net:'AGND',           c:C.wg},
+  {dy:86, n:'DVDD',       net:'3V3_IN',         c:C.wp},
+  {dy:104,n:'DGND',       net:'DGND',           c:C.wg},
+  {dy:128,n:'CAP',        net:'U1_CAP',         c:C.jnc},
+  {dy:148,n:'REFIN',      net:'VREF_1V25_ADC',  c:C.wa},
+  {dy:168,n:'XTAL1/CLKIN',net:'ADC_CLKIN',      c:C.wc},
+  {dy:188,n:'XTAL2',      net:'NC',             c:C.pasB},
+  {dy:208,n:'THERMAL_PAD',net:'AGND',           c:C.wg},
+  {dy:248,n:'AIN0P',      net:'AIN0P_FILT',     c:C.wa},
+  {dy:266,n:'AIN0N',      net:'AIN0N_FILT',     c:C.wa},
+  {dy:286,n:'AIN1P',      net:'AIN1P_FILT',     c:C.wa},
+  {dy:304,n:'AIN1N',      net:'AIN1N_FILT',     c:C.wa},
+  {dy:324,n:'AIN2P',      net:'AIN2P_FILT',     c:C.wa},
+  {dy:342,n:'AIN2N',      net:'AIN2N_FILT',     c:C.wa},
+  {dy:362,n:'AIN3P',      net:'AIN3P_FILT',     c:C.wa},
+  {dy:380,n:'AIN3N',      net:'AIN3N_FILT',     c:C.wa},
+  {dy:400,n:'AIN4P',      net:'AIN4P_FILT',     c:C.wa},
+  {dy:418,n:'AIN4N',      net:'AIN4N_FILT',     c:C.wa},
+  {dy:438,n:'AIN5P',      net:'AIN5P_FILT',     c:C.wa},
+  {dy:456,n:'AIN5N',      net:'AIN5N_FILT',     c:C.wa},
+  {dy:476,n:'AIN6P',      net:'AGND',           c:C.wg},
+  {dy:492,n:'AIN6N',      net:'AGND',           c:C.wg},
+  {dy:508,n:'AIN7P',      net:'AGND',           c:C.wg},
+  {dy:524,n:'AIN7N',      net:'AGND',           c:C.wg},
+];
+u1L.forEach(p=>lpin(U1.x,U1.y,p.dy,p.n,p.net,p.c));
+
+const u1R=[
+  {dy:268,n:'CS',         net:'ESP_ADC_CS',       c:C.ws},
+  {dy:290,n:'SCLK',       net:'ESP_ADC_SCLK',     c:C.ws},
+  {dy:312,n:'DIN',        net:'ESP_ADC_MOSI',     c:C.ws},
+  {dy:334,n:'DOUT',       net:'ESP_ADC_MISO',     c:C.ws},
+  {dy:356,n:'DRDY',       net:'ESP_ADC_DRDY',     c:C.ws},
+  {dy:378,n:'SYNC/RST',   net:'ESP_ADC_SYNC_RST', c:C.ws},
+];
+u1R.forEach(p=>rpin(U1.x,U1.y,U1.w,p.dy,p.n,p.net,p.c));
+
+// ─── ADC Bypass Caps + R1 Pull-up ────────────────────────────────────────────
+const bx=975;
+box(bx,80, 120,40,'C4  1µF',  'AVDD – AGND',C.pas,C.pasB);
+nf(bx,100,'3V3A','l',C.wp); gnd(bx+60,120,'AGND');
+
+box(bx,130,120,40,'C5  1µF',  'DVDD – DGND',C.pas,C.pasB);
+nf(bx,150,'3V3_IN','l',C.wp); gnd(bx+60,170,'DGND');
+
+box(bx,180,120,40,'C6  220nF','U1_CAP – DGND',C.pas,C.pasB);
+nf(bx,200,'U1_CAP','l',C.jnc); gnd(bx+60,220,'DGND');
+
+box(bx,240,120,50,'R1  10kΩ', 'SYNC_RST – 3V3_IN\npull-up (boot safe)',C.pas,C.pasB);
+vcc(bx+60,240,'3V3_IN'); nf(bx,265,'ESP_ADC_SYNC_RST','l',C.ws);
+
+// ─── U2 Oscillator ───────────────────────────────────────────────────────────
+const U2={x:1490,y:82,w:250,h:155};
+box(U2.x,U2.y,U2.w,U2.h,'U2','SiTime SiT8924BA-22-33E\n8.192 MHz MEMS Oscillator',C.clk,C.clkB);
+// U2 left pins (inside text — no left overflow)
+[[50,'VDD','3V3_IN',C.wp],[75,'GND','DGND',C.wg],[100,'OE/ST','3V3_IN',C.wp]].forEach(([dy,n,net,c])=>{
+  const py=U2.y+dy;
+  g.fillStyle=c; g.font='8px monospace'; g.textAlign='start';
+  g.fillText(n+': ['+net+']', U2.x+5, py+3);
+  dot(U2.x,py,1.5,c);
+});
+// U2 OUT
+rpin(U2.x,U2.y,U2.w,90,'OUT','OSC_8M192',C.wc);
+
+// C7 Oscillator bypass
+box(1530,248,100,40,'C7  100nF','U2.VDD – DGND',C.pas,C.pasB);
+nf(1530,268,'3V3_IN','l',C.wp); gnd(1580,288,'DGND');
+
+// ─── R2/R3 Clock Path ────────────────────────────────────────────────────────
+box(1290,82, 130,40,'R2  33Ω','OSC_8M192 → CLKIN',C.pas,C.clkB);
+nf(1290,102,'OSC_8M192','l',C.wc); nf(1422,102,'ADC_CLKIN','r',C.wc);
+
+box(1290,132,130,40,'R3  0Ω  DNP','ESP_MCLK → CLKIN',C.pas,C.pasB);
+nf(1290,152,'ESP_ADC_MCLK','l',C.ws); nf(1422,152,'ADC_CLKIN','r',C.wc);
+
+// Clock notes box
+g.fillStyle=C.clk+'60'; g.strokeStyle=C.clkB+'50'; g.lineWidth=1;
+rr(1288,188,505,120,4); g.fill(); g.stroke();
+g.fillStyle=C.clkB; g.font='bold 9px monospace'; g.textAlign='left';
+g.fillText('CLOCK PATH — populate ONE path only:',1296,204);
+g.fillStyle=C.pin; g.font='9px monospace';
+['  ● External OSC (default):  R2 pop, R3 DNP, U2 populated',
+ '    U2.OUT → R2 (33Ω) → ADC_CLKIN → U1.XTAL1/CLKIN',
+ '  ● MCU clock (alternate):   R3 pop, R2+U2 DNP',
+ '    J1.GPIO_c → R3 (0Ω) → ADC_CLKIN → U1.XTAL1/CLKIN',
+ '  Max ADC MCLK: 8.192 MHz   SCLK max: MCLK/3'
+].forEach((l,i)=>{ g.fillText(l,1296,218+i*14); });
+
+// ─── U3 REF5025 ──────────────────────────────────────────────────────────────
+const U3={x:14,y:458,w:168,h:175};
+box(U3.x,U3.y,U3.w,U3.h,'U3','REF5025\n2.5 V Precision Reference',C.ana,C.anaB);
+// Left pins (supply) — draw inline text to avoid left overflow
+[[55,'VIN','3V3A',C.wp],[80,'GND','AGND',C.wg]].forEach(([dy,n,net,c])=>{
+  const py=U3.y+dy;
+  g.fillStyle=c; g.font='8px monospace'; g.textAlign='start';
+  g.fillText(n+': ['+net+']', U3.x+4, py+3);
+  dot(U3.x,py,1.5,c);
+});
+// Right pins
+rpin(U3.x,U3.y,U3.w,55,'NR',   'REF_NR',    C.wa);
+rpin(U3.x,U3.y,U3.w,80,'VOUT', 'VEXC_2V5',  C.anaB);
+rpin(U3.x,U3.y,U3.w,105,'(bias)','',C.pasB);
+
+// C8, C9
+box(14, 645,95,40,'C8  1µF',  'U3.VIN – AGND',C.pas,C.pasB);
+box(119,645,95,40,'C9  1µF',  'REF_NR – AGND',C.pas,C.pasB);
+nf(14,665,'3V3A','l',C.wp); nf(119,665,'REF_NR','l',C.wa);
+gnd(61,685,'AGND'); gnd(166,685,'AGND');
+
+// ─── VEXC_2V5 Output Chain ───────────────────────────────────────────────────
+box(204,458,115,40,'R4  1Ω','VEXC_2V5 → BULK',C.pas,C.pasB);
+nf(204,478,'VEXC_2V5','l',C.anaB); nf(321,478,'VEXC_2V5_BULK','r',C.anaB);
+
+box(204,508,115,40,'C10  10µF','BULK – AGND',C.pas,C.pasB);
+nf(204,528,'VEXC_2V5_BULK','l',C.anaB); gnd(261,548,'AGND');
+
+box(204,558,115,40,'C11  1µF','VEXC_2V5 – AGND',C.pas,C.pasB);
+nf(204,578,'VEXC_2V5','l',C.anaB); gnd(261,598,'AGND');
+
+// ─── VMID Divider R5/R6 ──────────────────────────────────────────────────────
+box(338,458,110,40,'R5  10kΩ','VEXC_2V5 → VMID',C.pas,C.pasB);
+nf(338,478,'VEXC_2V5','l',C.anaB);
+ln(393,498,393,508,C.wa); dot(393,503,3,C.wa); nf(395,503,'VMID_RAW','r',C.wa);
+
+box(338,508,110,40,'R6  10kΩ','VMID → AGND',C.pas,C.pasB);
+gnd(393,548,'AGND');
+
+// ─── U4 OPA2333 ──────────────────────────────────────────────────────────────
+const U4={x:464,y:458,w:200,h:220};
+box(U4.x,U4.y,U4.w,U4.h,'U4','OPA2333\nDual Zero-Drift Op-Amp',C.ana,C.anaB);
+// Supply (inline text)
+[[50,'V+','3V3A',C.wp],[70,'V−','AGND',C.wg]].forEach(([dy,n,net,c])=>{
+  const py=U4.y+dy;
+  g.fillStyle=c; g.font='8px monospace'; g.textAlign='start';
+  g.fillText(n+': ['+net+']', U4.x+5, py+3);
+  dot(U4.x,py,1.5,c);
+});
+// U4A sub-block
+g.fillStyle=C.anaB+'30'; rr(U4.x+4,U4.y+95,U4.w-8,55,3); g.fill();
+g.fillStyle=C.anaB; g.font='bold 9px monospace'; g.textAlign='left';
+g.fillText('U4A  VMID_AINN buffer  (unity)',U4.x+7,U4.y+109);
+g.fillStyle=C.pin; g.font='8px monospace';
+g.fillText('+IN ← VMID_RAW',U4.x+7,U4.y+122);
+g.fillText('−IN = OUT  (unity gain)',U4.x+7,U4.y+135);
+rpin(U4.x,U4.y,U4.w,120,'OUT','VMID_AINN_BUF',C.wa);
+
+// U4B sub-block
+g.fillStyle=C.anaB+'30'; rr(U4.x+4,U4.y+158,U4.w-8,55,3); g.fill();
+g.fillStyle=C.anaB; g.font='bold 9px monospace'; g.textAlign='left';
+g.fillText('U4B  VREF_1V25 buffer  (unity)',U4.x+7,U4.y+172);
+g.fillStyle=C.pin; g.font='8px monospace';
+g.fillText('+IN ← VMID_RAW',U4.x+7,U4.y+185);
+g.fillText('−IN = OUT  (unity gain)',U4.x+7,U4.y+198);
+rpin(U4.x,U4.y,U4.w,183,'OUT','VREF_1V25_BUF',C.wa);
+
+// C12 bypass
+box(464,690,100,40,'C12  100nF','U4.V+ – AGND',C.pas,C.pasB);
+nf(464,710,'3V3A','l',C.wp); gnd(514,730,'AGND');
+
+// ─── R7/R8 VREF path ─────────────────────────────────────────────────────────
+box(464,750,120,40,'R7  10Ω  DNP','VREF_BUF → VREF_ADC',C.pas,C.pasB);
+box(464,800,120,40,'R8  0Ω','VREF_BUF → VREF_ADC',C.pas,C.pasB);
+nf(464,770,'VREF_1V25_BUF','l',C.wa); nf(586,770,'VREF_1V25_ADC','r',C.wa);
+nf(464,820,'VREF_1V25_BUF','l',C.wa); nf(586,820,'VREF_1V25_ADC','r',C.wa);
+g.fillStyle=C.dim; g.font='8px monospace'; g.textAlign='center';
+g.fillText('(DNP R7 · pop R8 for rev-A)',524,856);
+
+// ─── J2 Sensor Connector ─────────────────────────────────────────────────────
+const J2={x:14,y:808,w:165,h:270};
+box(J2.x,J2.y,J2.w,J2.h,'J2','FT_SENSOR_CONNECTOR',C.sen,C.senB);
+const j2p=[
+  {dy:52, n:'VEXC+', net:'VEXC_2V5', c:C.anaB},
+  {dy:74, n:'VEXC−', net:'AGND',     c:C.wg},
+  {dy:108,n:'G0',    net:'FT_G0',    c:C.wa},
+  {dy:130,n:'G1',    net:'FT_G1',    c:C.wa},
+  {dy:152,n:'G2',    net:'FT_G2',    c:C.wa},
+  {dy:174,n:'G3',    net:'FT_G3',    c:C.wa},
+  {dy:196,n:'G4',    net:'FT_G4',    c:C.wa},
+  {dy:218,n:'G5',    net:'FT_G5',    c:C.wa},
+  {dy:244,n:'shield',net:'CHASSIS',  c:C.pasB},
+];
+j2p.forEach(p=>rpin(J2.x,J2.y,J2.w,p.dy,p.n,p.net,p.c));
+
+// C13/C14 near sensor connector
+box(197,808,110,40,'C13  1µF',  'VEXC – AGND',C.pas,C.pasB);
+box(197,858,110,40,'C14  100nF','VEXC – AGND',C.pas,C.pasB);
+nf(197,828,'VEXC_2V5','l',C.anaB); gnd(252,848,'AGND');
+nf(197,878,'VEXC_2V5','l',C.anaB); gnd(252,898,'AGND');
+
+// ─── Analog Input Filters CH0–CH5 ────────────────────────────────────────────
+const CHANS=[
+  {ch:0,sig:'FT_G0',rp:'R10',rn:'R11',c:'C20'},
+  {ch:1,sig:'FT_G1',rp:'R12',rn:'R13',c:'C21'},
+  {ch:2,sig:'FT_G2',rp:'R14',rn:'R15',c:'C22'},
+  {ch:3,sig:'FT_G3',rp:'R16',rn:'R17',c:'C23'},
+  {ch:4,sig:'FT_G4',rp:'R18',rn:'R19',c:'C24'},
+  {ch:5,sig:'FT_G5',rp:'R20',rn:'R21',c:'C25'},
+];
+
+CHANS.forEach((ch,i)=>{
+  const fx=325+i*155, fy=790, fw=140, fh=330;
+  // channel bg
+  g.fillStyle=(i%2===0)?'#0d1422':'#0b1320';
+  g.strokeStyle='#263050'; g.lineWidth=1;
+  rr(fx,fy,fw,fh,4); g.fill(); g.stroke();
+
+  // CH label
+  g.fillStyle='#79c0ff'; g.font='bold 10px monospace'; g.textAlign='center';
+  g.fillText('CH'+ch.ch, fx+fw/2, fy+15);
+
+  // Input signal net label
+  nf(fx+fw/2-30, fy+32, ch.sig, 'r', C.wa);
+
+  // Rp: signal series resistor
+  g.fillStyle=C.pas; g.strokeStyle=C.pasB; g.lineWidth=1.2;
+  rr(fx+8,fy+48,fw-16,36,3); g.fill(); g.stroke();
+  g.fillStyle=C.txt; g.font='bold 9px monospace'; g.textAlign='center';
+  g.fillText(ch.rp+'  1kΩ', fx+fw/2, fy+61);
+  g.fillStyle=C.dim; g.font='8px monospace';
+  g.fillText(ch.sig+'→AIN'+ch.ch+'P', fx+fw/2, fy+74);
+
+  // Rn: VMID series resistor
+  g.fillStyle=C.pas; g.strokeStyle=C.pasB; g.lineWidth=1.2;
+  rr(fx+8,fy+100,fw-16,36,3); g.fill(); g.stroke();
+  g.fillStyle=C.txt; g.font='bold 9px monospace'; g.textAlign='center';
+  g.fillText(ch.rn+'  1kΩ', fx+fw/2, fy+113);
+  g.fillStyle=C.dim; g.font='8px monospace';
+  g.fillText('VMID→AIN'+ch.ch+'N', fx+fw/2, fy+126);
+  // VMID net label on left
+  nf(fx+8,fy+118,'VMID_AINN_BUF','l',C.wa);
+
+  // C diff: 10nF differential cap
+  g.fillStyle=C.pas; g.strokeStyle=C.pasB; g.lineWidth=1.2;
+  rr(fx+8,fy+152,fw-16,36,3); g.fill(); g.stroke();
+  g.fillStyle=C.txt; g.font='bold 9px monospace'; g.textAlign='center';
+  g.fillText(ch.c+'  10nF', fx+fw/2, fy+165);
+  g.fillStyle=C.dim; g.font='8px monospace';
+  g.fillText('AIN'+ch.ch+'P – AIN'+ch.ch+'N', fx+fw/2, fy+178);
+
+  // Wire stubs
+  ln(fx+fw/2, fy+84, fx+fw/2, fy+100, C.wa);
+  ln(fx+fw/2, fy+136,fx+fw/2, fy+152, C.wa);
+
+  // Output net labels to ADC
+  g.fillStyle=C.wa; g.font='bold 8px monospace'; g.textAlign='center';
+  g.fillText('AIN'+ch.ch+'P_FILT', fx+fw/2, fy+208);
+  g.fillText('AIN'+ch.ch+'N_FILT', fx+fw/2, fy+220);
+
+  // Arrow upward (dotted) indicating connection to U1
+  g.strokeStyle=C.wa+'50'; g.lineWidth=1; g.setLineDash([4,4]);
+  ln(fx+fw/2, fy, fx+fw/2, fy-15, C.wa+'50');
+  g.setLineDash([]);
+
+  // ADC connection note
+  g.fillStyle=C.adcB; g.font='8px monospace'; g.textAlign='center';
+  g.fillText('→ U1.AIN'+ch.ch+'P/N', fx+fw/2, fy+240);
+
+  // TI RC filter note
+  g.fillStyle=C.dim; g.font='7px monospace';
+  g.fillText('TI recommended RC', fx+fw/2, fy+258);
+  g.fillText('1k+1k+10nF diff', fx+fw/2, fy+268);
+});
+
+// ─── Unused Channels CH6/CH7 ─────────────────────────────────────────────────
+const ux=1258, uy=808;
+g.fillStyle='#100d14'; g.strokeStyle='#333344'; g.lineWidth=1;
+rr(ux,uy,220,220,4); g.fill(); g.stroke();
+g.fillStyle=C.pasB; g.font='bold 10px monospace'; g.textAlign='center';
+g.fillText('UNUSED  CH6 & CH7', ux+110, uy+16);
+const uLines=[
+  {t:'Direct tie to AGND:', c:C.dim},
+  {t:'U1.AIN6P → AGND',    c:C.wg},
+  {t:'U1.AIN6N → AGND',    c:C.wg},
+  {t:'U1.AIN7P → AGND',    c:C.wg},
+  {t:'U1.AIN7N → AGND',    c:C.wg},
+  {t:'',c:C.dim},
+  {t:'Or via 0Ω links (rework):', c:C.dim},
+  {t:'R30  0Ω  AIN6P_FILT–AGND', c:C.pasB},
+  {t:'R31  0Ω  AIN6N_FILT–AGND', c:C.pasB},
+  {t:'R32  0Ω  AIN7P_FILT–AGND', c:C.pasB},
+  {t:'R33  0Ω  AIN7N_FILT–AGND', c:C.pasB},
+];
+uLines.forEach((l,i)=>{
+  g.fillStyle=l.c; g.font='8.5px monospace'; g.textAlign='left';
+  g.fillText(l.t, ux+8, uy+34+i*16);
+});
+
+// ─── SPI Bus Summary ─────────────────────────────────────────────────────────
+g.fillStyle='#081510'; g.strokeStyle=C.ws+'50'; g.lineWidth=1;
+rr(8,1135,875,100,4); g.fill(); g.stroke();
+g.fillStyle=C.ws; g.font='bold 10px monospace'; g.textAlign='left';
+g.fillText('SPI BUS  —  J1 (ESP32-S3 SuperMini) ↔ U1 (ADS131M08)', 16,1151);
+[
+  'CS          J1.GPIO_x  ──→  U1.CS           (active-low, select ADC)',
+  'SCLK        J1.GPIO_y  ──→  U1.SCLK         (serial clock, max MCLK/3)',
+  'MOSI / DIN  J1.GPIO_z  ──→  U1.DIN          (commands + config to ADC)',
+  'MISO / DOUT J1.GPIO_w  ←──  U1.DOUT         (conversion data from ADC)',
+  'DRDY        J1.GPIO_a  ←──  U1.DRDY         (active-low data ready)',
+  'SYNC/RST    J1.GPIO_b  ──→  U1.SYNC_RESET   (R1 10kΩ pull-up to 3V3_IN)',
+].forEach((s,i)=>{
+  g.fillStyle=C.pin; g.font='9px monospace'; g.textAlign='left';
+  g.fillText(s, 16, 1165+i*12);
+});
+
+// ─── Net Cross-Reference (key nets) ──────────────────────────────────────────
+g.fillStyle='#0a1018'; g.strokeStyle='#304060'; g.lineWidth=1;
+rr(895,1135,895,100,4); g.fill(); g.stroke();
+g.fillStyle='#79c0ff'; g.font='bold 10px monospace'; g.textAlign='left';
+g.fillText('KEY NET CROSS-REFERENCE', 903,1151);
+const nets=[
+  ['3V3_IN',         'J1.3V3 → FB1 → [C3,C5,R1,U1.DVDD,U2.VDD,R2/R3 src,R1 top]'],
+  ['3V3A',           'FB1 out → [C1,C2,U1.AVDD,U3.VIN,U4.V+,C4 top] (analog VDD)'],
+  ['VEXC_2V5',       'U3.VOUT → R4 → [C11,J2.VEXC+,C13,C14] (sensor excitation)'],
+  ['VMID_RAW',       'R5/R6 mid-point → U4A.+IN and U4B.+IN (1.25V from 2.5V div)'],
+  ['VMID_AINN_BUF',  'U4A.OUT → all RxN filter inputs (buffered 1.25V common-mode)'],
+  ['VREF_1V25_ADC',  'U4B.OUT → R8(0Ω) → U1.REFIN (buffered 1.25V ADC reference)'],
+  ['ADC_CLKIN',      'R2 or R3 output → U1.XTAL1/CLKIN (8.192 MHz)'],
+];
+nets.forEach((n,i)=>{
+  g.fillStyle=C.net; g.font='bold 8px monospace'; g.textAlign='left';
+  g.fillText(n[0].padEnd(18), 903, 1165+i*12);
+  g.fillStyle=C.dim; g.font='8px monospace';
+  g.fillText(n[1], 1040, 1165+i*12);
+});
+
+// ─── Title Bar ───────────────────────────────────────────────────────────────
+g.fillStyle='#111827'; g.fillRect(0,1245,W,15);
+g.strokeStyle='#30363d'; g.lineWidth=1; g.strokeRect(0,1245,W,15);
+g.fillStyle=C.dim; g.font='9px monospace'; g.textAlign='left';
+g.fillText('minDAQ · netlist_5025 · ADS131M08 (TI) · REF5025 (TI) · OPA2333 (TI) · SiTime SiT8924BA 8.192MHz · ESP32-S3 SuperMini · 6-ch F/T DAQ', 8,1256);
+g.textAlign='right';
+g.fillText('visual schematic (auto-generated)', W-8,1256);
+</script>
+</body>
+</html>
