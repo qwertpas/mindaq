@@ -11,6 +11,8 @@ A cheap and minimal data aquisition system for reading 6-axis force/torque senso
 - Display live force/torque data on Adafruit color TFT
 - 42 x 29 mm board size
 - 2-layer, single side components, JLCPCB economic assembly
+- About $11 in parts cost per board (including ESP32S3)
+- Single order of 2pcs is $70, 5pcs is $120 including everything (shipping and customs about doubles the cost!) 
 
 
 ![Front Side](media/v1_front.jpg)
