@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import queue
 import struct
 import sys
@@ -37,6 +38,12 @@ PACKET_SIZE = PACKET.size
 WINDOW_SECONDS = 5.0
 DEFAULT_RATE_HZ = 2000.0
 COLORS = ["#ff6b35", "#f39c12", "#27ae60", "#2980b9", "#8e44ad", "#c0392b"]
+MAX_FORWARD_JUMP_US = 250_000
+WRAP_LOW_US = 10_000_000
+WRAP_HIGH_US = 0xF0000000
+NOTCH_Q = 10.0
+NOTCH_FREQS = (60.0, 120.0)
+USB_PORT_PREFIXES = ("/dev/cu.usbmodem", "/dev/tty.usbmodem", "/dev/ttyACM", "/dev/ttyUSB")
 
 
 def gages_to_ft(values: tuple[float, ...]) -> tuple[float, ...]:
@@ -56,23 +63,38 @@ def plot_position(index: int, show_ft: bool) -> tuple[int, int]:
     return index // 2, index % 2
 
 
-def find_serial_port(pattern: str | None) -> str:
+def find_serial_port(pattern: str | None) -> str | None:
     if pattern:
         matches = sorted(glob(pattern))
-        return matches[0] if matches else pattern
+        if matches:
+            for match in matches:
+                if match.startswith(USB_PORT_PREFIXES):
+                    return match
+            return None
+        for prefix in USB_PORT_PREFIXES:
+            if pattern.startswith(prefix):
+                family = sorted(glob(f"{prefix}*"))
+                if family:
+                    return family[0]
+        return None
 
     if list_ports is not None:
         ports = list(list_ports.comports())
 
         def score(port_info) -> tuple[int, str]:
+            device = port_info.device or ""
+            if not device.startswith(USB_PORT_PREFIXES):
+                return -1, device
             text = " ".join(
                 [
-                    port_info.device or "",
+                    device,
                     port_info.description or "",
                     port_info.manufacturer or "",
                     port_info.hwid or "",
                 ]
             ).lower()
+            if "bluetooth" in text:
+                return -1, device
             value = 0
             if getattr(port_info, "vid", None) == 0x303A:
                 value += 100
@@ -80,23 +102,26 @@ def find_serial_port(pattern: str | None) -> str:
                 value += 80
             if "usbmodem" in text or "cdc" in text:
                 value += 20
-            return value, port_info.device or ""
+            return value, device
 
         if ports:
-            return sorted(ports, key=lambda item: (-score(item)[0], score(item)[1]))[0].device
+            ranked = [item for item in ports if score(item)[0] >= 0]
+            if ranked:
+                return sorted(ranked, key=lambda item: (-score(item)[0], score(item)[1]))[0].device
 
-    for candidate in ("/dev/cu.usbmodem*", "/dev/ttyACM*", "/dev/ttyUSB*"):
+    for candidate in ("/dev/cu.usbmodem*", "/dev/tty.usbmodem*", "/dev/ttyACM*", "/dev/ttyUSB*"):
         matches = sorted(glob(candidate))
         if matches:
             return matches[0]
 
-    raise SystemExit("No serial port found")
+    return None
 
 
 @dataclass
 class Sample:
     timestamp_s: float
     ft_uv: tuple[float, ...]
+    ft_filtered: tuple[float, ...]
 
 
 class SampleBuffer:
@@ -112,25 +137,119 @@ class SampleBuffer:
         with self.lock:
             return list(self.samples)
 
+    def clear(self) -> None:
+        with self.lock:
+            self.samples.clear()
+
+
+class NotchFilter:
+    def __init__(self, freq_hz: float, sample_rate_hz: float = DEFAULT_RATE_HZ, q: float = NOTCH_Q) -> None:
+        w0 = 2.0 * math.pi * freq_hz / sample_rate_hz
+        alpha = math.sin(w0) / (2.0 * q)
+        a0 = 1.0 + alpha
+        self.b0 = 1.0 / a0
+        self.b1 = (-2.0 * math.cos(w0)) / a0
+        self.b2 = 1.0 / a0
+        self.a1 = (-2.0 * math.cos(w0)) / a0
+        self.a2 = (1.0 - alpha) / a0
+        self.x1 = 0.0
+        self.x2 = 0.0
+        self.y1 = 0.0
+        self.y2 = 0.0
+        self.ready = False
+
+    def step(self, value: float) -> float:
+        if not self.ready:
+            self.x1 = value
+            self.x2 = value
+            self.y1 = value
+            self.y2 = value
+            self.ready = True
+            return value
+        output = (
+            self.b0 * value
+            + self.b1 * self.x1
+            + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2
+        )
+        self.x2 = self.x1
+        self.x1 = value
+        self.y2 = self.y1
+        self.y1 = output
+        return output
+
 
 class SerialReader(threading.Thread):
-    def __init__(self, ser: serial.Serial, samples: SampleBuffer, messages: queue.Queue[str]) -> None:
+    def __init__(self, port_hint: str | None, samples: SampleBuffer, messages: queue.Queue[str]) -> None:
         super().__init__(daemon=True)
-        self.ser = ser
+        self.port_hint = port_hint
         self.samples = samples
         self.messages = messages
         self.stop_event = threading.Event()
+        self.ser: serial.Serial | None = None
+        self.current_port = port_hint
         self.buffer = bytearray()
         self.wrap_offset_us = 0
         self.last_timestamp_us: int | None = None
+        self.ft_filters = [
+            [NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS
+        ]
+        self.connected = False
+
+    def reset_stream(self) -> None:
+        self.samples.clear()
+        self.buffer.clear()
+        self.wrap_offset_us = 0
+        self.last_timestamp_us = None
+        self.ft_filters = [[NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS]
+
+    def connect(self) -> bool:
+        port = find_serial_port(self.port_hint)
+        if port is None:
+            if self.connected:
+                self.messages.put("searching for board")
+            self.connected = False
+            self.current_port = self.port_hint
+            return False
+        try:
+            self.ser = open_serial(port)
+        except (serial.SerialException, OSError):
+            self.ser = None
+            self.connected = False
+            self.current_port = port
+            return False
+        self.current_port = port
+        self.connected = True
+        self.reset_stream()
+        self.messages.put(f"connected {port}")
+        return True
+
+    def disconnect(self) -> None:
+        if self.ser is not None:
+            try:
+                self.ser.close()
+            except (serial.SerialException, OSError):
+                pass
+        self.ser = None
+        if self.connected and not self.stop_event.is_set():
+            self.messages.put("reconnecting")
+        self.connected = False
 
     def run(self) -> None:
         while not self.stop_event.is_set():
+            if self.ser is None and not self.connect():
+                time.sleep(0.5)
+                continue
             try:
                 chunk = self.ser.read(4096)
             except (serial.SerialException, OSError) as exc:
+                if self.stop_event.is_set():
+                    break
                 self.messages.put(f"[serial error] {exc}")
-                return
+                self.disconnect()
+                time.sleep(0.2)
+                continue
             if not chunk:
                 continue
             self.buffer.extend(chunk)
@@ -152,29 +271,51 @@ class SerialReader(threading.Thread):
 
             sync, timestamp_us, *values, _ = PACKET.unpack(frame)
             if sync == SYNC:
-                if self.last_timestamp_us is not None and timestamp_us < self.last_timestamp_us:
-                    self.wrap_offset_us += 1 << 32
+                if self.last_timestamp_us is not None:
+                    if timestamp_us < self.last_timestamp_us:
+                        if self.last_timestamp_us >= WRAP_HIGH_US and timestamp_us <= WRAP_LOW_US:
+                            self.wrap_offset_us += 1 << 32
+                        else:
+                            del self.buffer[0]
+                            continue
+                    elif timestamp_us - self.last_timestamp_us > MAX_FORWARD_JUMP_US:
+                        del self.buffer[0]
+                        continue
                 self.last_timestamp_us = timestamp_us
                 full_timestamp_s = (self.wrap_offset_us + timestamp_us) / 1e6
-                self.samples.append(Sample(timestamp_s=full_timestamp_s, ft_uv=tuple(values)))
+                ft_filtered = list(gages_to_ft(tuple(values)))
+                for index, value in enumerate(ft_filtered):
+                    for filt in self.ft_filters[index]:
+                        value = filt.step(value)
+                    ft_filtered[index] = value
+                self.samples.append(
+                    Sample(
+                        timestamp_s=full_timestamp_s,
+                        ft_uv=tuple(values),
+                        ft_filtered=tuple(ft_filtered),
+                    )
+                )
 
             del self.buffer[:PACKET_SIZE]
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.disconnect()
 
 
 class PlotWindow:
-    def __init__(self, port: str, samples: SampleBuffer, messages: queue.Queue[str]) -> None:
-        self.port = port
+    def __init__(self, reader: SerialReader, samples: SampleBuffer, messages: queue.Queue[str]) -> None:
+        self.reader = reader
         self.samples = samples
         self.messages = messages
         self.last_message = "connecting"
         self.paused = False
         self.paused_samples: list[Sample] | None = None
         self.show_ft = True
+        self.filter_ft = True
         self.zero_raw = [0.0] * len(RAW_CHANNELS)
         self.zero_ft = [0.0] * len(FT_CHANNELS)
+        self.auto_zero_pending = True
 
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         self.win = QtWidgets.QWidget()
@@ -183,7 +324,7 @@ class PlotWindow:
 
         layout = QtWidgets.QVBoxLayout(self.win)
 
-        self.status = QtWidgets.QLabel(f"port={port} | waiting for telemetry")
+        self.status = QtWidgets.QLabel("port=searching | waiting for telemetry")
         layout.addWidget(self.status)
 
         button_row = QtWidgets.QHBoxLayout()
@@ -198,6 +339,10 @@ class PlotWindow:
         self.mode_button = QtWidgets.QPushButton("Show Voltages")
         self.mode_button.clicked.connect(self.toggle_mode)
         button_row.addWidget(self.mode_button)
+
+        self.filter_button = QtWidgets.QPushButton("60 Hz Filter On")
+        self.filter_button.clicked.connect(self.toggle_filter)
+        button_row.addWidget(self.filter_button)
 
         self.save_button = QtWidgets.QPushButton("Save CSV")
         self.save_button.clicked.connect(self.save_csv)
@@ -234,7 +379,9 @@ class PlotWindow:
         return "arb" if self.show_ft else "uV"
 
     def sample_values(self, sample: Sample) -> tuple[float, ...]:
-        return gages_to_ft(sample.ft_uv) if self.show_ft else sample.ft_uv
+        if not self.show_ft:
+            return sample.ft_uv
+        return sample.ft_filtered if self.filter_ft else gages_to_ft(sample.ft_uv)
 
     def zero_values(self) -> list[float]:
         return self.zero_ft if self.show_ft else self.zero_raw
@@ -250,6 +397,11 @@ class PlotWindow:
             self.grid.removeWidget(plot)
             row, col = plot_position(index, self.show_ft)
             self.grid.addWidget(plot, row, col)
+
+    def toggle_filter(self) -> None:
+        self.filter_ft = not self.filter_ft
+        self.filter_button.setText("60 Hz Filter On" if self.filter_ft else "60 Hz Filter Off")
+        self.last_message = "60/120 Hz notch on" if self.filter_ft else "60/120 Hz notch off"
 
     def toggle_pause(self) -> None:
         self.paused = not self.paused
@@ -267,6 +419,13 @@ class PlotWindow:
         for index, value in enumerate(values):
             zero[index] = value
         self.last_message = "zero set"
+
+    def auto_zero(self, samples: list[Sample]) -> None:
+        latest = samples[-1]
+        self.zero_raw = list(latest.ft_uv)
+        self.zero_ft = list(self.sample_values(latest) if self.show_ft else gages_to_ft(latest.ft_uv))
+        self.auto_zero_pending = False
+        self.last_message = "startup zero set"
 
     def save_csv(self) -> None:
         samples = self.paused_samples if self.paused_samples is not None else self.samples.snapshot()
@@ -289,6 +448,8 @@ class PlotWindow:
         header.extend(f"{name}_uv_zeroed" for name in RAW_CHANNELS)
         header.extend(f"{name}_raw" for name in FT_CHANNELS)
         header.extend(f"{name}_zeroed" for name in FT_CHANNELS)
+        header.extend(f"{name}_filtered" for name in FT_CHANNELS)
+        header.extend(f"{name}_filtered_zeroed" for name in FT_CHANNELS)
 
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
@@ -301,6 +462,8 @@ class PlotWindow:
                     + [f"{value - zero:.3f}" for value, zero in zip(sample.ft_uv, self.zero_raw)]
                     + [f"{value:.3f}" for value in ft_values]
                     + [f"{value - zero:.3f}" for value, zero in zip(ft_values, self.zero_ft)]
+                    + [f"{value:.3f}" for value in sample.ft_filtered]
+                    + [f"{value - zero:.3f}" for value, zero in zip(sample.ft_filtered, self.zero_ft)]
                 )
 
         self.last_message = f"saved {len(samples)} samples"
@@ -313,8 +476,17 @@ class PlotWindow:
                 break
 
         samples = self.paused_samples if self.paused_samples is not None else self.samples.snapshot()
+        port = self.reader.current_port or "searching"
         if not samples:
-            self.status.setText(f"port={self.port} | {self.last_message}")
+            for curve in self.curves:
+                curve.setData([], [])
+            self.auto_zero_pending = True
+            self.status.setText(f"port={port} | {self.last_message}")
+            return
+
+        if self.auto_zero_pending:
+            self.auto_zero(samples)
+            self.status.setText(f"port={port} | {self.last_message}")
             return
 
         if self.last_message == "connecting":
@@ -342,7 +514,7 @@ class PlotWindow:
             for name, value, offset in zip(self.current_names(), latest_values, zero)
         )
         self.status.setText(
-            f"port={self.port} | rate={rate_hz:.1f} Hz | {latest_text} | {self.last_message}"
+            f"port={port} | rate={rate_hz:.1f} Hz | {latest_text} | {self.last_message}"
         )
 
     def exec(self) -> int:
@@ -361,20 +533,17 @@ def main() -> int:
     parser.add_argument("--port")
     args = parser.parse_args()
 
-    port = find_serial_port(args.port)
-    ser = open_serial(port)
     samples = SampleBuffer()
     messages: queue.Queue[str] = queue.Queue()
-    reader = SerialReader(ser, samples, messages)
+    reader = SerialReader(args.port, samples, messages)
     reader.start()
 
-    window = PlotWindow(port, samples, messages)
+    window = PlotWindow(reader, samples, messages)
     try:
         return window.exec()
     finally:
         reader.stop()
         reader.join(timeout=1.0)
-        ser.close()
 
 
 if __name__ == "__main__":

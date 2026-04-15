@@ -1,3 +1,5 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
 #include <Arduino.h>
 #include <SPI.h>
 
@@ -18,10 +20,19 @@ constexpr uint8_t kAdcDrdyPin = 11;
 constexpr uint8_t kAdcCsPin = 12;
 constexpr uint8_t kAdcSyncPin = 13;
 
-constexpr uint8_t kModeReg = 0x02;
-constexpr uint8_t kClockReg = 0x03;
-constexpr uint8_t kGain1Reg = 0x04;
-constexpr uint8_t kGain2Reg = 0x05;
+constexpr uint8_t kTftSclkPin = 43;
+constexpr uint8_t kTftMisoPin = 44;
+constexpr uint8_t kTftMosiPin = 1;
+constexpr uint8_t kTftCsPin = 2;
+constexpr uint8_t kTftRstPin = 4;
+constexpr uint8_t kTftDcPin = 5;
+constexpr uint8_t kSdCsPin = 6;
+constexpr uint8_t kTftLitPin = 7;
+
+constexpr uint16_t kModeReg = 0x02;
+constexpr uint16_t kClockReg = 0x03;
+constexpr uint16_t kGain1Reg = 0x04;
+constexpr uint16_t kGain2Reg = 0x05;
 constexpr uint8_t kChCfgRegs[kActiveChannels] = {0x09, 0x0E, 0x13, 0x18, 0x1D, 0x22};
 
 constexpr uint16_t kModeValue = 0x0110;
@@ -37,6 +48,22 @@ constexpr uint8_t kStartupDiscardFrames = 8;
 constexpr uint8_t kSettleDiscardFrames = 16;
 
 constexpr int32_t kGainLimitCode = 0x700000;
+constexpr uint32_t kZeroTimeMs = 1000;
+constexpr uint16_t kZeroStepMs = 100;
+constexpr uint32_t kDisplayRateHz = 30;
+constexpr uint32_t kDisplayPeriodMs = 1000 / kDisplayRateHz;
+constexpr BaseType_t kDisplayCore = 0;
+constexpr uint32_t kDisplayStackWords = 4096;
+constexpr uint32_t kTftSpiHz = 10000000;
+constexpr float kDisplayTextStepUv = 1.0f;
+
+constexpr uint16_t kBgColor = ST77XX_BLACK;
+constexpr uint16_t kBorderColor = ST77XX_WHITE;
+constexpr uint16_t kTrackColor = ST77XX_BLUE;
+constexpr uint16_t kPosColor = ST77XX_GREEN;
+constexpr uint16_t kNegColor = ST77XX_RED;
+constexpr uint16_t kTextColor = ST77XX_WHITE;
+constexpr uint16_t kZeroColor = ST77XX_YELLOW;
 
 struct __attribute__((packed)) TelemetryPacket {
   uint16_t sync;
@@ -56,6 +83,20 @@ enum class InputMode : uint8_t {
   Shorted = 1,
   TestPositive = 2,
   TestNegative = 3,
+};
+
+enum class DisplayStatus : uint8_t {
+  Boot = 0,
+  Retry = 1,
+  Zeroing = 2,
+  Ready = 3,
+};
+
+struct DisplaySnapshot {
+  float values[kActiveChannels] = {};
+  uint8_t gain_code = 0;
+  DisplayStatus status = DisplayStatus::Boot;
+  uint16_t zero_progress = 0;
 };
 
 uint8_t packetChecksum(const TelemetryPacket &packet) {
@@ -243,7 +284,8 @@ class Ads131m08 {
     }
 
     const uint16_t ack = static_cast<uint16_t>(null_rx[0] >> 8);
-    const uint16_t expected = static_cast<uint16_t>(0x4000u | (static_cast<uint16_t>(address) << 7));
+    const uint16_t expected =
+        static_cast<uint16_t>(0x4000u | (static_cast<uint16_t>(address) << 7));
     return ack == expected;
   }
 
@@ -278,17 +320,112 @@ class Ads131m08 {
 };
 
 Ads131m08 adc;
+SPIClass tft_spi(HSPI);
+Adafruit_ST7789 tft(&tft_spi, kTftCsPin, kTftDcPin, kTftRstPin);
+
+portMUX_TYPE display_lock = portMUX_INITIALIZER_UNLOCKED;
+DisplaySnapshot display_snapshot;
+
 bool adc_ready = false;
 InputMode input_mode = InputMode::External;
 uint8_t gain_code = 7;
 char command_buffer[32];
 uint8_t command_length = 0;
 uint32_t last_init_attempt_ms = 0;
+TaskHandle_t display_task_handle = nullptr;
+uint32_t zero_start_ms = 0;
+uint32_t zero_count = 0;
+double zero_sum[kActiveChannels] = {};
+float zero_offset[kActiveChannels] = {};
+bool zero_done = false;
 
 float codeToUv() {
   const float gain = static_cast<float>(1 << gain_code);
   const float full_scale_volts = 1.2f / gain;
   return (full_scale_volts * 1.0e6f) / 8388608.0f;
+}
+
+float displayFullScaleUv(uint8_t code) {
+  return 1.2e6f / static_cast<float>(1 << code);
+}
+
+void resolveFt(const float gages[kActiveChannels], float ft[kActiveChannels]) {
+  const float g0 = gages[0];
+  const float g1 = gages[1];
+  const float g2 = gages[2];
+  const float g3 = gages[3];
+  const float g4 = gages[4];
+  const float g5 = gages[5];
+  ft[0] = 0.5f * (g1 - g3);
+  ft[1] = 0.25f * (-g1 - g3 + 2.0f * g5);
+  ft[2] = 0.25f * (g0 + g2 + 2.0f * g4);
+  ft[3] = 0.5f * (g2 - g0);
+  ft[4] = 0.25f * (g0 + g2 - 2.0f * g4);
+  ft[5] = 0.25f * (g1 + g3 + 2.0f * g5);
+}
+
+void setDisplayStatus(DisplayStatus status, uint16_t zero_progress = 0) {
+  portENTER_CRITICAL(&display_lock);
+  display_snapshot.status = status;
+  display_snapshot.zero_progress = zero_progress;
+  display_snapshot.gain_code = gain_code;
+  portEXIT_CRITICAL(&display_lock);
+}
+
+void publishDisplayValues(const float ft[kActiveChannels], DisplayStatus status, uint16_t zero_progress) {
+  portENTER_CRITICAL(&display_lock);
+  for (size_t i = 0; i < kActiveChannels; ++i) {
+    display_snapshot.values[i] = ft[i];
+  }
+  display_snapshot.status = status;
+  display_snapshot.zero_progress = zero_progress;
+  display_snapshot.gain_code = gain_code;
+  portEXIT_CRITICAL(&display_lock);
+}
+
+void resetZeroing() {
+  zero_start_ms = millis();
+  zero_count = 0;
+  zero_done = false;
+  for (size_t i = 0; i < kActiveChannels; ++i) {
+    zero_sum[i] = 0.0;
+    zero_offset[i] = 0.0f;
+  }
+  setDisplayStatus(DisplayStatus::Zeroing, 0);
+}
+
+void updateDisplayData(const float gages[kActiveChannels]) {
+  float ft[kActiveChannels];
+  resolveFt(gages, ft);
+
+  if (!zero_done) {
+    if (zero_start_ms == 0) {
+      resetZeroing();
+    }
+    for (size_t i = 0; i < kActiveChannels; ++i) {
+      zero_sum[i] += ft[i];
+    }
+    ++zero_count;
+    const uint32_t elapsed = millis() - zero_start_ms;
+    if (elapsed >= kZeroTimeMs && zero_count > 0) {
+      for (size_t i = 0; i < kActiveChannels; ++i) {
+        zero_offset[i] = static_cast<float>(zero_sum[i] / static_cast<double>(zero_count));
+        ft[i] -= zero_offset[i];
+      }
+      zero_done = true;
+      publishDisplayValues(ft, DisplayStatus::Ready, 1000);
+      return;
+    }
+    const uint16_t progress =
+        static_cast<uint16_t>(min<uint32_t>(elapsed, kZeroTimeMs) / kZeroStepMs) * kZeroStepMs;
+    setDisplayStatus(DisplayStatus::Zeroing, progress);
+    return;
+  }
+
+  for (size_t i = 0; i < kActiveChannels; ++i) {
+    ft[i] -= zero_offset[i];
+  }
+  publishDisplayValues(ft, DisplayStatus::Ready, 1000);
 }
 
 void discardLine() {
@@ -327,14 +464,30 @@ bool setInputModeFromCommand(InputMode mode, const char *name) {
 bool setGainFromValue(uint16_t gain_value) {
   uint8_t code = 0;
   switch (gain_value) {
-    case 1: code = 0; break;
-    case 2: code = 1; break;
-    case 4: code = 2; break;
-    case 8: code = 3; break;
-    case 16: code = 4; break;
-    case 32: code = 5; break;
-    case 64: code = 6; break;
-    case 128: code = 7; break;
+    case 1:
+      code = 0;
+      break;
+    case 2:
+      code = 1;
+      break;
+    case 4:
+      code = 2;
+      break;
+    case 8:
+      code = 3;
+      break;
+    case 16:
+      code = 4;
+      break;
+    case 32:
+      code = 5;
+      break;
+    case 64:
+      code = 6;
+      break;
+    case 128:
+      code = 7;
+      break;
     default:
       writeLine("bad gain");
       return false;
@@ -441,12 +594,193 @@ void readCommands() {
   }
 }
 
+void drawStatusScreen(const DisplaySnapshot &snapshot) {
+  tft.fillScreen(kBgColor);
+  tft.setTextColor(kTextColor);
+  tft.setTextSize(2);
+  tft.setCursor(12, 18);
+  switch (snapshot.status) {
+    case DisplayStatus::Boot:
+      tft.print("Booting...");
+      break;
+    case DisplayStatus::Retry:
+      tft.print("ADC retry");
+      break;
+    case DisplayStatus::Zeroing:
+      tft.print("Zeroing...");
+      tft.setTextSize(1);
+      tft.setCursor(12, 48);
+      tft.print(snapshot.zero_progress / 1000.0f, 2);
+      tft.print(" s");
+      break;
+    case DisplayStatus::Ready:
+      break;
+  }
+  tft.setTextSize(1);
+  tft.setCursor(12, 108);
+  tft.print("gain x");
+  tft.print(1 << snapshot.gain_code);
+}
+
+void drawZeroProgress(uint16_t zero_progress) {
+  tft.fillRect(12, 48, 72, 10, kBgColor);
+  tft.setTextColor(kTextColor);
+  tft.setTextSize(1);
+  tft.setCursor(12, 48);
+  tft.print(zero_progress / 1000.0f, 1);
+  tft.print(" s");
+}
+
+int16_t barFillForValue(float value, float full_scale) {
+  const int16_t track_w = 120 - 8;
+  const int16_t half_w = track_w / 2;
+  const float clamped = constrain(value, -full_scale, full_scale);
+  const int16_t fill =
+      static_cast<int16_t>((fabsf(clamped) / full_scale) * static_cast<float>(half_w - 2));
+  return clamped >= 0.0f ? fill : -fill;
+}
+
+int32_t textValueForDisplay(float value) {
+  return static_cast<int32_t>(lroundf(value / kDisplayTextStepUv) * kDisplayTextStepUv);
+}
+
+void drawBarCellStatic(int16_t x, int16_t y, int16_t w, int16_t h, const char *name) {
+  const int16_t margin = 4;
+  const int16_t track_x = x + margin;
+  const int16_t track_y = y + 16;
+  const int16_t track_w = w - margin * 2;
+  const int16_t track_h = 12;
+  const int16_t center_x = track_x + track_w / 2;
+
+  tft.drawRect(x, y, w, h, kBorderColor);
+  tft.setTextSize(1);
+  tft.setTextColor(kTextColor);
+  tft.setCursor(x + margin, y + 3);
+  tft.print(name);
+
+  tft.drawRect(track_x, track_y, track_w, track_h, kTrackColor);
+  tft.drawFastVLine(center_x, track_y + 1, track_h - 2, kZeroColor);
+}
+
+void drawBarCellValue(int16_t x, int16_t y, int16_t w, int16_t h, int16_t fill, int32_t text_value) {
+  const int16_t margin = 4;
+  const int16_t track_x = x + margin;
+  const int16_t track_y = y + 16;
+  const int16_t track_w = w - margin * 2;
+  const int16_t track_h = 12;
+  const int16_t center_x = track_x + track_w / 2;
+
+  tft.fillRect(track_x + 1, track_y + 1, track_w - 2, track_h - 2, kBgColor);
+  tft.drawFastVLine(center_x, track_y + 1, track_h - 2, kZeroColor);
+
+  if (fill > 0) {
+    tft.fillRect(center_x + 1, track_y + 1, fill, track_h - 2, kPosColor);
+  } else if (fill < 0) {
+    tft.fillRect(center_x + fill, track_y + 1, -fill, track_h - 2, kNegColor);
+  }
+
+  tft.fillRect(x + margin, y + 32, w - margin * 2, 10, kBgColor);
+  tft.setTextSize(1);
+  tft.setTextColor(kTextColor);
+  tft.setCursor(x + margin, y + 32);
+  tft.print(text_value);
+}
+
+void drawBarsScreenFrame(const DisplaySnapshot &snapshot, bool clear_screen) {
+  const char *names[kActiveChannels] = {"Fx", "Fy", "Fz", "Tx", "Ty", "Tz"};
+  const float full_scale = displayFullScaleUv(snapshot.gain_code);
+  if (clear_screen) {
+    tft.fillScreen(kBgColor);
+    for (size_t i = 0; i < kActiveChannels; ++i) {
+      const int16_t col = static_cast<int16_t>(i / 3);
+      const int16_t row = static_cast<int16_t>(i % 3);
+      drawBarCellStatic(col * 120, row * 45, 120, 45, names[i]);
+      drawBarCellValue(col * 120, row * 45, 120, 45, barFillForValue(snapshot.values[i], full_scale),
+                       textValueForDisplay(snapshot.values[i]));
+    }
+  }
+}
+
+void displayTask(void *param) {
+  (void)param;
+  TickType_t last_wake = xTaskGetTickCount();
+  DisplayStatus last_status = DisplayStatus::Boot;
+  uint16_t last_zero_progress = 0xFFFF;
+  bool bars_initialized = false;
+  int16_t last_fill[kActiveChannels] = {};
+  int32_t last_text[kActiveChannels] = {};
+  while (true) {
+    DisplaySnapshot snapshot;
+    portENTER_CRITICAL(&display_lock);
+    snapshot = display_snapshot;
+    portEXIT_CRITICAL(&display_lock);
+
+    if (snapshot.status == DisplayStatus::Ready) {
+      const bool force_redraw = !bars_initialized || last_status != DisplayStatus::Ready;
+      const float full_scale = displayFullScaleUv(snapshot.gain_code);
+      if (force_redraw) {
+        drawBarsScreenFrame(snapshot, true);
+        for (size_t i = 0; i < kActiveChannels; ++i) {
+          last_fill[i] = barFillForValue(snapshot.values[i], full_scale);
+          last_text[i] = textValueForDisplay(snapshot.values[i]);
+        }
+      } else {
+        for (size_t i = 0; i < kActiveChannels; ++i) {
+          const int16_t fill = barFillForValue(snapshot.values[i], full_scale);
+          const int32_t text_value = textValueForDisplay(snapshot.values[i]);
+          if (fill == last_fill[i] && text_value == last_text[i]) {
+            continue;
+          }
+          const int16_t col = static_cast<int16_t>(i / 3);
+          const int16_t row = static_cast<int16_t>(i % 3);
+          drawBarCellValue(col * 120, row * 45, 120, 45, fill, text_value);
+          last_fill[i] = fill;
+          last_text[i] = text_value;
+        }
+      }
+      bars_initialized = true;
+    } else {
+      if (snapshot.status != last_status) {
+        drawStatusScreen(snapshot);
+      } else if (snapshot.status == DisplayStatus::Zeroing &&
+                 snapshot.zero_progress != last_zero_progress) {
+        drawZeroProgress(snapshot.zero_progress);
+      }
+      bars_initialized = false;
+    }
+
+    last_status = snapshot.status;
+    last_zero_progress = snapshot.zero_progress;
+    vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(kDisplayPeriodMs));
+  }
+}
+
+void initDisplay() {
+  pinMode(kSdCsPin, OUTPUT);
+  digitalWrite(kSdCsPin, HIGH);
+  pinMode(kTftLitPin, OUTPUT);
+  digitalWrite(kTftLitPin, HIGH);
+
+  tft_spi.begin(kTftSclkPin, kTftMisoPin, kTftMosiPin, kTftCsPin);
+  tft.init(135, 240);
+  tft.setSPISpeed(kTftSpiHz);
+  tft.setRotation(1);
+  tft.fillScreen(kBgColor);
+  drawStatusScreen(display_snapshot);
+
+  xTaskCreatePinnedToCore(displayTask, "display", kDisplayStackWords, nullptr, 1,
+                          &display_task_handle, kDisplayCore);
+}
+
 }  // namespace
 
 void setup() {
   Serial.begin(kSerialBaud);
   delay(200);
   writeLine("boot");
+  setDisplayStatus(DisplayStatus::Boot, 0);
+  disableCore0WDT();
+  initDisplay();
 }
 
 void loop() {
@@ -459,15 +793,18 @@ void loop() {
         if (!chooseGain()) {
           adc_ready = false;
           writeLine("gain select failed");
+          setDisplayStatus(DisplayStatus::Retry, 0);
           delay(10);
           return;
         }
+        resetZeroing();
         writeLine("adc ready");
         Serial.print("# gain=");
         Serial.println(1 << gain_code);
         writeStatusLine("boot");
       } else {
         writeLine("adc retry");
+        setDisplayStatus(DisplayStatus::Retry, 0);
       }
     }
     delay(10);
@@ -479,10 +816,6 @@ void loop() {
     return;
   }
 
-  if (Serial.availableForWrite() < static_cast<int>(sizeof(TelemetryPacket))) {
-    return;
-  }
-
   TelemetryPacket packet{};
   packet.sync = kPacketSync;
   packet.timestamp_us = micros();
@@ -490,6 +823,12 @@ void loop() {
   for (size_t i = 0; i < kActiveChannels; ++i) {
     packet.ft_uv[i] = static_cast<float>(frame.raw[i]) * code_to_uv;
   }
+  updateDisplayData(packet.ft_uv);
+
+  if (Serial.availableForWrite() < static_cast<int>(sizeof(TelemetryPacket))) {
+    return;
+  }
+
   packet.checksum = packetChecksum(packet);
   Serial.write(reinterpret_cast<const uint8_t *>(&packet), sizeof(packet));
 }

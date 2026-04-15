@@ -2,6 +2,8 @@
 
 A cheap and minimal data aquisition system for reading 6-axis force/torque sensors at high rates.
 
+![demo](media/demo.gif)
+
 - 2.5V strain gauge excitation using precision reference (REF5025)
 - Simultaneous sampling 24-bit ADC (ADS131M08) with 8 channels at 32k samples/second for
     - 6x strain gauges
