@@ -55,7 +55,6 @@ constexpr uint32_t kDisplayPeriodMs = 1000 / kDisplayRateHz;
 constexpr BaseType_t kDisplayCore = 0;
 constexpr uint32_t kDisplayStackWords = 4096;
 constexpr uint32_t kTftSpiHz = 10000000;
-constexpr float kDisplayTextStepUv = 1.0f;
 
 constexpr uint16_t kBgColor = ST77XX_BLACK;
 constexpr uint16_t kBorderColor = ST77XX_WHITE;
@@ -65,10 +64,25 @@ constexpr uint16_t kNegColor = ST77XX_RED;
 constexpr uint16_t kTextColor = ST77XX_WHITE;
 constexpr uint16_t kZeroColor = ST77XX_YELLOW;
 
+// Fitted from calibration/FT8978 Net.xml onto the existing geometric basis so
+// the live axis conventions stay aligned with the current board wiring.
+constexpr float kFtScale[kActiveChannels] = {
+    5.242261206577384e-4f,
+    6.711481094720999e-4f,
+    1.491585028973418e-3f,
+    3.382662814280309e-6f,
+    3.926013399015233e-6f,
+    5.998476015074367e-6f,
+};
+
+constexpr float kDisplayFullScale[kActiveChannels] = {
+    12.0f, 12.0f, 17.0f, 0.12f, 0.12f, 0.12f,
+};
+
 struct __attribute__((packed)) TelemetryPacket {
   uint16_t sync;
   uint32_t timestamp_us;
-  float ft_uv[kActiveChannels];
+  float ft[kActiveChannels];
   uint8_t checksum;
 };
 
@@ -345,10 +359,6 @@ float codeToUv() {
   return (full_scale_volts * 1.0e6f) / 8388608.0f;
 }
 
-float displayFullScaleUv(uint8_t code) {
-  return 1.2e6f / static_cast<float>(1 << code);
-}
-
 void resolveFt(const float gages[kActiveChannels], float ft[kActiveChannels]) {
   const float g0 = gages[0];
   const float g1 = gages[1];
@@ -356,12 +366,12 @@ void resolveFt(const float gages[kActiveChannels], float ft[kActiveChannels]) {
   const float g3 = gages[3];
   const float g4 = gages[4];
   const float g5 = gages[5];
-  ft[0] = 0.5f * (g1 - g3);
-  ft[1] = 0.25f * (-g1 - g3 + 2.0f * g5);
-  ft[2] = 0.25f * (g0 + g2 + 2.0f * g4);
-  ft[3] = 0.5f * (g2 - g0);
-  ft[4] = 0.25f * (g0 + g2 - 2.0f * g4);
-  ft[5] = 0.25f * (g1 + g3 + 2.0f * g5);
+  ft[0] = 0.5f * (g1 - g3) * kFtScale[0];
+  ft[1] = 0.25f * (-g1 - g3 + 2.0f * g5) * kFtScale[1];
+  ft[2] = 0.25f * (g0 + g2 + 2.0f * g4) * kFtScale[2];
+  ft[3] = 0.5f * (g2 - g0) * kFtScale[3];
+  ft[4] = 0.25f * (g0 + g2 - 2.0f * g4) * kFtScale[4];
+  ft[5] = 0.25f * (g1 + g3 + 2.0f * g5) * kFtScale[5];
 }
 
 void setDisplayStatus(DisplayStatus status, uint16_t zero_progress = 0) {
@@ -394,10 +404,12 @@ void resetZeroing() {
   setDisplayStatus(DisplayStatus::Zeroing, 0);
 }
 
-void updateDisplayData(const float gages[kActiveChannels]) {
+void updateDisplayData(const float ft_in[kActiveChannels], float ft_out[kActiveChannels]) {
   float ft[kActiveChannels];
-  resolveFt(gages, ft);
-
+  for (size_t i = 0; i < kActiveChannels; ++i) {
+    ft[i] = ft_in[i];
+    ft_out[i] = 0.0f;
+  }
   if (!zero_done) {
     if (zero_start_ms == 0) {
       resetZeroing();
@@ -411,6 +423,7 @@ void updateDisplayData(const float gages[kActiveChannels]) {
       for (size_t i = 0; i < kActiveChannels; ++i) {
         zero_offset[i] = static_cast<float>(zero_sum[i] / static_cast<double>(zero_count));
         ft[i] -= zero_offset[i];
+        ft_out[i] = ft[i];
       }
       zero_done = true;
       publishDisplayValues(ft, DisplayStatus::Ready, 1000);
@@ -424,6 +437,7 @@ void updateDisplayData(const float gages[kActiveChannels]) {
 
   for (size_t i = 0; i < kActiveChannels; ++i) {
     ft[i] -= zero_offset[i];
+    ft_out[i] = ft[i];
   }
   publishDisplayValues(ft, DisplayStatus::Ready, 1000);
 }
@@ -640,11 +654,12 @@ int16_t barFillForValue(float value, float full_scale) {
   return clamped >= 0.0f ? fill : -fill;
 }
 
-int32_t textValueForDisplay(float value) {
-  return static_cast<int32_t>(lroundf(value / kDisplayTextStepUv) * kDisplayTextStepUv);
+uint8_t valueDecimals(size_t axis) {
+  return axis < 3 ? 2 : 3;
 }
 
-void drawBarCellStatic(int16_t x, int16_t y, int16_t w, int16_t h, const char *name) {
+void drawBarCellStatic(int16_t x, int16_t y, int16_t w, int16_t h, const char *name,
+                       const char *unit) {
   const int16_t margin = 4;
   const int16_t track_x = x + margin;
   const int16_t track_y = y + 16;
@@ -657,12 +672,15 @@ void drawBarCellStatic(int16_t x, int16_t y, int16_t w, int16_t h, const char *n
   tft.setTextColor(kTextColor);
   tft.setCursor(x + margin, y + 3);
   tft.print(name);
+  tft.print(" ");
+  tft.print(unit);
 
   tft.drawRect(track_x, track_y, track_w, track_h, kTrackColor);
   tft.drawFastVLine(center_x, track_y + 1, track_h - 2, kZeroColor);
 }
 
-void drawBarCellValue(int16_t x, int16_t y, int16_t w, int16_t h, int16_t fill, int32_t text_value) {
+void drawBarCellValue(int16_t x, int16_t y, int16_t w, int16_t h, int16_t fill, float value,
+                      size_t axis) {
   const int16_t margin = 4;
   const int16_t track_x = x + margin;
   const int16_t track_y = y + 16;
@@ -683,20 +701,21 @@ void drawBarCellValue(int16_t x, int16_t y, int16_t w, int16_t h, int16_t fill, 
   tft.setTextSize(1);
   tft.setTextColor(kTextColor);
   tft.setCursor(x + margin, y + 32);
-  tft.print(text_value);
+  tft.print(value, valueDecimals(axis));
 }
 
 void drawBarsScreenFrame(const DisplaySnapshot &snapshot, bool clear_screen) {
   const char *names[kActiveChannels] = {"Fx", "Fy", "Fz", "Tx", "Ty", "Tz"};
-  const float full_scale = displayFullScaleUv(snapshot.gain_code);
+  const char *units[kActiveChannels] = {"N", "N", "N", "Nm", "Nm", "Nm"};
   if (clear_screen) {
     tft.fillScreen(kBgColor);
     for (size_t i = 0; i < kActiveChannels; ++i) {
       const int16_t col = static_cast<int16_t>(i / 3);
       const int16_t row = static_cast<int16_t>(i % 3);
-      drawBarCellStatic(col * 120, row * 45, 120, 45, names[i]);
-      drawBarCellValue(col * 120, row * 45, 120, 45, barFillForValue(snapshot.values[i], full_scale),
-                       textValueForDisplay(snapshot.values[i]));
+      drawBarCellStatic(col * 120, row * 45, 120, 45, names[i], units[i]);
+      drawBarCellValue(col * 120, row * 45, 120, 45,
+                       barFillForValue(snapshot.values[i], kDisplayFullScale[i]), snapshot.values[i],
+                       i);
     }
   }
 }
@@ -708,7 +727,7 @@ void displayTask(void *param) {
   uint16_t last_zero_progress = 0xFFFF;
   bool bars_initialized = false;
   int16_t last_fill[kActiveChannels] = {};
-  int32_t last_text[kActiveChannels] = {};
+  float last_value[kActiveChannels] = {};
   while (true) {
     DisplaySnapshot snapshot;
     portENTER_CRITICAL(&display_lock);
@@ -717,25 +736,24 @@ void displayTask(void *param) {
 
     if (snapshot.status == DisplayStatus::Ready) {
       const bool force_redraw = !bars_initialized || last_status != DisplayStatus::Ready;
-      const float full_scale = displayFullScaleUv(snapshot.gain_code);
       if (force_redraw) {
         drawBarsScreenFrame(snapshot, true);
         for (size_t i = 0; i < kActiveChannels; ++i) {
-          last_fill[i] = barFillForValue(snapshot.values[i], full_scale);
-          last_text[i] = textValueForDisplay(snapshot.values[i]);
+          last_fill[i] = barFillForValue(snapshot.values[i], kDisplayFullScale[i]);
+          last_value[i] = snapshot.values[i];
         }
       } else {
         for (size_t i = 0; i < kActiveChannels; ++i) {
-          const int16_t fill = barFillForValue(snapshot.values[i], full_scale);
-          const int32_t text_value = textValueForDisplay(snapshot.values[i]);
-          if (fill == last_fill[i] && text_value == last_text[i]) {
+          const int16_t fill = barFillForValue(snapshot.values[i], kDisplayFullScale[i]);
+          if (fill == last_fill[i] &&
+              fabsf(snapshot.values[i] - last_value[i]) < (i < 3 ? 0.01f : 0.001f)) {
             continue;
           }
           const int16_t col = static_cast<int16_t>(i / 3);
           const int16_t row = static_cast<int16_t>(i % 3);
-          drawBarCellValue(col * 120, row * 45, 120, 45, fill, text_value);
+          drawBarCellValue(col * 120, row * 45, 120, 45, fill, snapshot.values[i], i);
           last_fill[i] = fill;
-          last_text[i] = text_value;
+          last_value[i] = snapshot.values[i];
         }
       }
       bars_initialized = true;
@@ -819,11 +837,17 @@ void loop() {
   TelemetryPacket packet{};
   packet.sync = kPacketSync;
   packet.timestamp_us = micros();
+  float gages_uv[kActiveChannels];
   const float code_to_uv = codeToUv();
   for (size_t i = 0; i < kActiveChannels; ++i) {
-    packet.ft_uv[i] = static_cast<float>(frame.raw[i]) * code_to_uv;
+    gages_uv[i] = static_cast<float>(frame.raw[i]) * code_to_uv;
   }
-  updateDisplayData(packet.ft_uv);
+  float ft[kActiveChannels];
+  resolveFt(gages_uv, ft);
+  for (size_t i = 0; i < kActiveChannels; ++i) {
+    packet.ft[i] = ft[i];
+  }
+  updateDisplayData(ft, packet.ft);
 
   if (Serial.availableForWrite() < static_cast<int>(sizeof(TelemetryPacket))) {
     return;

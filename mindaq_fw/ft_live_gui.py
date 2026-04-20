@@ -30,8 +30,9 @@ except ImportError as exc:
     ) from exc
 
 BAUD = 2_000_000
-RAW_CHANNELS = ["FT_G0", "FT_G1", "FT_G2", "FT_G3", "FT_G4", "FT_G5"]
+SERIAL_PORT = "/dev/cu.usbmodem1101"
 FT_CHANNELS = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
+FT_UNITS = ["N", "N", "N", "Nm", "Nm", "Nm"]
 PACKET = struct.Struct("<HI6fB")
 SYNC = 0xA55A
 PACKET_SIZE = PACKET.size
@@ -46,24 +47,13 @@ NOTCH_FREQS = (60.0, 120.0)
 USB_PORT_PREFIXES = ("/dev/cu.usbmodem", "/dev/tty.usbmodem", "/dev/ttyACM", "/dev/ttyUSB")
 
 
-def gages_to_ft(values: tuple[float, ...]) -> tuple[float, ...]:
-    g0, g1, g2, g3, g4, g5 = values
-    fx = 0.5 * (g1 - g3)
-    fy = 0.25 * (-g1 - g3 + 2.0 * g5)
-    fz = 0.25 * (g0 + g2 + 2.0 * g4)
-    tx = 0.5 * (g2 - g0)
-    ty = 0.25 * (g0 + g2 - 2.0 * g4)
-    tz = 0.25 * (g1 + g3 + 2.0 * g5)
-    return (fx, fy, fz, tx, ty, tz)
-
-
-def plot_position(index: int, show_ft: bool) -> tuple[int, int]:
-    if show_ft:
-        return index % 3, index // 3
-    return index // 2, index % 2
+def plot_position(index: int) -> tuple[int, int]:
+    return index % 3, index // 3
 
 
 def find_serial_port(pattern: str | None) -> str | None:
+    if pattern is None:
+        pattern = SERIAL_PORT
     if pattern:
         matches = sorted(glob(pattern))
         if matches:
@@ -117,10 +107,42 @@ def find_serial_port(pattern: str | None) -> str | None:
     return None
 
 
+def available_serial_ports() -> list[str]:
+    ports: list[str] = []
+    seen: set[str] = set()
+
+    def add(device: str) -> None:
+        if not device.startswith(USB_PORT_PREFIXES) or device in seen:
+            return
+        seen.add(device)
+        ports.append(device)
+
+    if list_ports is not None:
+        for port_info in sorted(list_ports.comports(), key=lambda item: item.device or ""):
+            device = port_info.device or ""
+            text = " ".join(
+                [
+                    device,
+                    port_info.description or "",
+                    port_info.manufacturer or "",
+                    port_info.hwid or "",
+                ]
+            ).lower()
+            if "bluetooth" in text:
+                continue
+            add(device)
+
+    for candidate in ("/dev/cu.usbmodem*", "/dev/tty.usbmodem*", "/dev/ttyACM*", "/dev/ttyUSB*"):
+        for match in sorted(glob(candidate)):
+            add(match)
+
+    return ports
+
+
 @dataclass
 class Sample:
     timestamp_s: float
-    ft_uv: tuple[float, ...]
+    ft: tuple[float, ...]
     ft_filtered: tuple[float, ...]
 
 
@@ -196,6 +218,7 @@ class SerialReader(threading.Thread):
             [NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS
         ]
         self.connected = False
+        self.port_lock = threading.Lock()
 
     def reset_stream(self) -> None:
         self.samples.clear()
@@ -205,12 +228,14 @@ class SerialReader(threading.Thread):
         self.ft_filters = [[NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS]
 
     def connect(self) -> bool:
-        port = find_serial_port(self.port_hint)
+        with self.port_lock:
+            port_hint = self.port_hint
+        port = find_serial_port(port_hint)
         if port is None:
             if self.connected:
                 self.messages.put("searching for board")
             self.connected = False
-            self.current_port = self.port_hint
+            self.current_port = port_hint
             return False
         try:
             self.ser = open_serial(port)
@@ -283,7 +308,7 @@ class SerialReader(threading.Thread):
                         continue
                 self.last_timestamp_us = timestamp_us
                 full_timestamp_s = (self.wrap_offset_us + timestamp_us) / 1e6
-                ft_filtered = list(gages_to_ft(tuple(values)))
+                ft_filtered = list(values)
                 for index, value in enumerate(ft_filtered):
                     for filt in self.ft_filters[index]:
                         value = filt.step(value)
@@ -291,7 +316,7 @@ class SerialReader(threading.Thread):
                 self.samples.append(
                     Sample(
                         timestamp_s=full_timestamp_s,
-                        ft_uv=tuple(values),
+                        ft=tuple(values),
                         ft_filtered=tuple(ft_filtered),
                     )
                 )
@@ -300,6 +325,12 @@ class SerialReader(threading.Thread):
 
     def stop(self) -> None:
         self.stop_event.set()
+        self.disconnect()
+
+    def set_port_hint(self, port_hint: str | None) -> None:
+        with self.port_lock:
+            self.port_hint = port_hint
+            self.current_port = port_hint
         self.disconnect()
 
 
@@ -311,9 +342,7 @@ class PlotWindow:
         self.last_message = "connecting"
         self.paused = False
         self.paused_samples: list[Sample] | None = None
-        self.show_ft = True
         self.filter_ft = True
-        self.zero_raw = [0.0] * len(RAW_CHANNELS)
         self.zero_ft = [0.0] * len(FT_CHANNELS)
         self.auto_zero_pending = True
 
@@ -328,6 +357,14 @@ class PlotWindow:
         layout.addWidget(self.status)
 
         button_row = QtWidgets.QHBoxLayout()
+        self.port_box = QtWidgets.QComboBox()
+        self.port_box.currentIndexChanged.connect(self.change_port)
+        button_row.addWidget(self.port_box)
+
+        self.refresh_ports_button = QtWidgets.QPushButton("Refresh Ports")
+        self.refresh_ports_button.clicked.connect(self.refresh_ports)
+        button_row.addWidget(self.refresh_ports_button)
+
         self.pause_button = QtWidgets.QPushButton("Pause")
         self.pause_button.clicked.connect(self.toggle_pause)
         button_row.addWidget(self.pause_button)
@@ -335,10 +372,6 @@ class PlotWindow:
         self.zero_button = QtWidgets.QPushButton("Zero All")
         self.zero_button.clicked.connect(self.zero_all)
         button_row.addWidget(self.zero_button)
-
-        self.mode_button = QtWidgets.QPushButton("Show Voltages")
-        self.mode_button.clicked.connect(self.toggle_mode)
-        button_row.addWidget(self.mode_button)
 
         self.filter_button = QtWidgets.QPushButton("60 Hz Filter On")
         self.filter_button.clicked.connect(self.toggle_filter)
@@ -358,12 +391,12 @@ class PlotWindow:
         for index, name in enumerate(FT_CHANNELS):
             plot = pg.PlotWidget(title=name)
             plot.showGrid(x=True, y=True, alpha=0.25)
-            plot.setLabel("left", "arb")
+            plot.setLabel("left", FT_UNITS[index])
             plot.setLabel("bottom", "Time (s)")
             curve = plot.plot(pen=pg.mkPen(COLORS[index], width=2))
             self.plots.append(plot)
             self.curves.append(curve)
-            row, col = plot_position(index, True)
+            row, col = plot_position(index)
             self.grid.addWidget(plot, row, col)
 
         self.win.show()
@@ -372,31 +405,43 @@ class PlotWindow:
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
 
-    def current_names(self) -> list[str]:
-        return FT_CHANNELS if self.show_ft else RAW_CHANNELS
+        self.refresh_ports()
 
-    def current_unit(self) -> str:
-        return "arb" if self.show_ft else "uV"
+    def current_names(self) -> list[str]:
+        return FT_CHANNELS
+
+    def current_unit(self, index: int) -> str:
+        return FT_UNITS[index]
 
     def sample_values(self, sample: Sample) -> tuple[float, ...]:
-        if not self.show_ft:
-            return sample.ft_uv
-        return sample.ft_filtered if self.filter_ft else gages_to_ft(sample.ft_uv)
+        return sample.ft_filtered if self.filter_ft else sample.ft
 
     def zero_values(self) -> list[float]:
-        return self.zero_ft if self.show_ft else self.zero_raw
+        return self.zero_ft
 
-    def toggle_mode(self) -> None:
-        self.show_ft = not self.show_ft
-        self.mode_button.setText("Show Voltages" if self.show_ft else "Show Unscaled F/T")
-        self.last_message = "showing unscaled F/T" if self.show_ft else "showing voltages"
-        unit = self.current_unit()
-        for index, (plot, name) in enumerate(zip(self.plots, self.current_names())):
-            plot.setTitle(name)
-            plot.setLabel("left", unit)
-            self.grid.removeWidget(plot)
-            row, col = plot_position(index, self.show_ft)
-            self.grid.addWidget(plot, row, col)
+    def refresh_ports(self) -> None:
+        current = self.port_box.currentData()
+        if current is None:
+            current = self.reader.port_hint
+        ports = available_serial_ports()
+
+        self.port_box.blockSignals(True)
+        self.port_box.clear()
+        self.port_box.addItem("Auto", None)
+        for port in ports:
+            self.port_box.addItem(port, port)
+
+        index = self.port_box.findData(current)
+        if index < 0 and self.reader.current_port is not None:
+            index = self.port_box.findData(self.reader.current_port)
+        self.port_box.setCurrentIndex(index if index >= 0 else 0)
+        self.port_box.blockSignals(False)
+
+    def change_port(self) -> None:
+        port_hint = self.port_box.currentData()
+        self.reader.set_port_hint(port_hint)
+        self.auto_zero_pending = True
+        self.last_message = f"port={'auto' if port_hint is None else port_hint}"
 
     def toggle_filter(self) -> None:
         self.filter_ft = not self.filter_ft
@@ -422,8 +467,7 @@ class PlotWindow:
 
     def auto_zero(self, samples: list[Sample]) -> None:
         latest = samples[-1]
-        self.zero_raw = list(latest.ft_uv)
-        self.zero_ft = list(self.sample_values(latest) if self.show_ft else gages_to_ft(latest.ft_uv))
+        self.zero_ft = list(self.sample_values(latest))
         self.auto_zero_pending = False
         self.last_message = "startup zero set"
 
@@ -444,8 +488,6 @@ class PlotWindow:
             return
 
         header = ["timestamp_s"]
-        header.extend(f"{name}_uv_raw" for name in RAW_CHANNELS)
-        header.extend(f"{name}_uv_zeroed" for name in RAW_CHANNELS)
         header.extend(f"{name}_raw" for name in FT_CHANNELS)
         header.extend(f"{name}_zeroed" for name in FT_CHANNELS)
         header.extend(f"{name}_filtered" for name in FT_CHANNELS)
@@ -455,13 +497,10 @@ class PlotWindow:
             writer = csv.writer(handle)
             writer.writerow(header)
             for sample in samples:
-                ft_values = gages_to_ft(sample.ft_uv)
                 writer.writerow(
                     [f"{sample.timestamp_s:.6f}"]
-                    + [f"{value:.3f}" for value in sample.ft_uv]
-                    + [f"{value - zero:.3f}" for value, zero in zip(sample.ft_uv, self.zero_raw)]
-                    + [f"{value:.3f}" for value in ft_values]
-                    + [f"{value - zero:.3f}" for value, zero in zip(ft_values, self.zero_ft)]
+                    + [f"{value:.3f}" for value in sample.ft]
+                    + [f"{value - zero:.3f}" for value, zero in zip(sample.ft, self.zero_ft)]
                     + [f"{value:.3f}" for value in sample.ft_filtered]
                     + [f"{value - zero:.3f}" for value, zero in zip(sample.ft_filtered, self.zero_ft)]
                 )
@@ -510,8 +549,8 @@ class PlotWindow:
 
         latest_values = self.sample_values(latest)
         latest_text = " ".join(
-            f"{name}={value - offset:+.1f}{self.current_unit()}"
-            for name, value, offset in zip(self.current_names(), latest_values, zero)
+            f"{name}={value - offset:+.3f}{self.current_unit(index)}"
+            for index, (name, value, offset) in enumerate(zip(self.current_names(), latest_values, zero))
         )
         self.status.setText(
             f"port={port} | rate={rate_hz:.1f} Hz | {latest_text} | {self.last_message}"
@@ -530,7 +569,7 @@ def open_serial(port: str) -> serial.Serial:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port")
+    parser.add_argument("--port", default=SERIAL_PORT)
     args = parser.parse_args()
 
     samples = SampleBuffer()
