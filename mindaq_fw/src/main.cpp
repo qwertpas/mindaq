@@ -64,15 +64,24 @@ constexpr uint16_t kNegColor = ST77XX_RED;
 constexpr uint16_t kTextColor = ST77XX_WHITE;
 constexpr uint16_t kZeroColor = ST77XX_YELLOW;
 
-// Fitted from calibration/FT8978 Net.xml onto the existing geometric basis so
-// the live axis conventions stay aligned with the current board wiring.
-constexpr float kFtScale[kActiveChannels] = {
-    5.242261206577384e-4f,
-    6.711481094720999e-4f,
-    1.491585028973418e-3f,
-    3.382662814280309e-6f,
-    3.926013399015233e-6f,
-    5.998476015074367e-6f,
+constexpr uint8_t kFactoryGaugeOrder[kActiveChannels] = {0, 3, 2, 5, 4, 1};
+
+// Factory calibration from calibration/FT8978 Net.xml, remapped onto the
+// current board wiring and current live axis conventions. Force rows are in
+// N/uV and torque rows are in Nm/uV.
+constexpr float kFactoryMatrix[kActiveChannels][kActiveChannels] = {
+    {-6.054530989079390e-06f, 5.034719323341890e-04f, 9.575586391247821e-06f,
+     -5.179287349565690e-04f, 2.827122413565440e-05f, -2.075418832354940e-05f},
+    {-2.520127206219610e-05f, -2.775572866673270e-04f, -1.038902452683050e-07f,
+     -3.247148267647300e-04f, 8.796242351000440e-06f, 6.348497973460170e-04f},
+    {4.950476642689660e-04f, 4.982665178403360e-05f, 5.498814948547810e-04f,
+     1.831416126079740e-05f, 5.962241921681900e-04f, 4.274870927968580e-05f},
+    {-3.172020201011310e-06f, 3.219636663939340e-06f, 1.741821139441800e-06f,
+     -3.070929538864320e-06f, 2.229410518476670e-06f, -4.085733997308220e-07f},
+    {-2.577052836577890e-07f, -1.381712094274260e-06f, 3.124957530622520e-06f,
+     -2.084386424212550e-06f, -3.204207898418680e-06f, 3.830766465429980e-06f},
+    {-9.943845273683800e-08f, 2.162107308175090e-06f, 2.397902398001370e-08f,
+     2.297459226084220e-06f, -7.705459896268520e-08f, 2.240688262268020e-06f},
 };
 
 constexpr float kDisplayFullScale[kActiveChannels] = {
@@ -360,18 +369,17 @@ float codeToUv() {
 }
 
 void resolveFt(const float gages[kActiveChannels], float ft[kActiveChannels]) {
-  const float g0 = gages[0];
-  const float g1 = gages[1];
-  const float g2 = gages[2];
-  const float g3 = gages[3];
-  const float g4 = gages[4];
-  const float g5 = gages[5];
-  ft[0] = 0.5f * (g1 - g3) * kFtScale[0];
-  ft[1] = 0.25f * (-g1 - g3 + 2.0f * g5) * kFtScale[1];
-  ft[2] = 0.25f * (g0 + g2 + 2.0f * g4) * kFtScale[2];
-  ft[3] = 0.5f * (g2 - g0) * kFtScale[3];
-  ft[4] = 0.25f * (g0 + g2 - 2.0f * g4) * kFtScale[4];
-  ft[5] = 0.25f * (g1 + g3 + 2.0f * g5) * kFtScale[5];
+  float factory_gages[kActiveChannels];
+  for (size_t i = 0; i < kActiveChannels; ++i) {
+    factory_gages[i] = gages[kFactoryGaugeOrder[i]];
+  }
+  for (size_t row = 0; row < kActiveChannels; ++row) {
+    float value = 0.0f;
+    for (size_t col = 0; col < kActiveChannels; ++col) {
+      value += kFactoryMatrix[row][col] * factory_gages[col];
+    }
+    ft[row] = value;
+  }
 }
 
 void setDisplayStatus(DisplayStatus status, uint16_t zero_progress = 0) {
