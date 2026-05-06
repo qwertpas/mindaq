@@ -34,18 +34,39 @@ BAUD = 2_000_000
 SERIAL_PORT = None
 FT_CHANNELS = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 FT_UNITS = ["N", "N", "N", "Nm", "Nm", "Nm"]
-PACKET = struct.Struct("<HI6fB")
-SYNC = 0xA55A
-PACKET_SIZE = PACKET.size
+SAMPLE_RATE_HZ = 32_000.0
+DISPLAY_RATE_HZ = 1000.0
+DISPLAY_DECIMATE = int(SAMPLE_RATE_HZ / DISPLAY_RATE_HZ)
+RAW_CHANNELS = 6
+SAMPLES_PER_BLOCK = 64
+RAW_BYTES = RAW_CHANNELS * 3
+SYNC = 0xA55AA55A
+SYNC_BYTES = b"\x5a\xa5\x5a\xa5"
+BLOCK = struct.Struct(f"<II{SAMPLES_PER_BLOCK * RAW_BYTES}sB")
+BLOCK_SIZE = BLOCK.size
 WINDOW_SECONDS = 5.0
-DEFAULT_RATE_HZ = 2000.0
 COLORS = ["#ff6b35", "#f39c12", "#27ae60", "#2980b9", "#8e44ad", "#c0392b"]
-MAX_FORWARD_JUMP_US = 250_000
-WRAP_LOW_US = 10_000_000
-WRAP_HIGH_US = 0xF0000000
 NOTCH_Q = 10.0
 NOTCH_FREQS = (60.0, 120.0)
 USB_PORT_PREFIXES = ("/dev/cu.usbmodem", "/dev/tty.usbmodem", "/dev/ttyACM", "/dev/ttyUSB", "COM")
+ADC_CODE_TO_NET_GAUGE = 0.016
+NET_GAUGE_ZERO = 32768.0
+ADC_ZERO_CODE = (-521738.0, -153570.0, -334040.0, 26775.0, -317685.0, -7511.0)
+GAUGE_OFFSET = (25212.0, 29526.0, 23086.0, 28152.0, 24516.0, 33182.0)
+FT_MATRIX = (
+    (9.575586391247820e-06, 5.034719323341890e-04, 2.827122413565440e-05,
+     -5.179287349565690e-04, -6.054530989079390e-06, -2.075418832354940e-05),
+    (-1.038902452683050e-07, -2.775572866673270e-04, 8.796242351000440e-06,
+     -3.247148267647300e-04, -2.520127206219610e-05, 6.348497973460170e-04),
+    (5.498814948547810e-04, 4.982665178403360e-05, 5.962241921681900e-04,
+     1.831416126079740e-05, 4.950476642689660e-04, 4.274870927968580e-05),
+    (-3.124957530622520e-06, 1.381712094274260e-06, 3.204207898418680e-06,
+     2.084386424212550e-06, 2.577052836577890e-07, -3.830766465429980e-06),
+    (1.741821139441800e-06, 3.219636663939340e-06, 2.229410518476670e-06,
+     -3.070929538864320e-06, -3.172020201011310e-06, -4.085733997308220e-07),
+    (2.397902398001370e-08, 2.162107308175090e-06, -7.705459896268520e-08,
+     2.297459226084220e-06, -9.943845273683800e-08, 2.240688262268020e-06),
+)
 
 
 def plot_position(index: int) -> tuple[int, int]:
@@ -144,15 +165,39 @@ def available_serial_ports() -> list[str]:
     return ports
 
 
+def block_valid(frame: bytes) -> bool:
+    check = 0
+    for byte in frame[:-1]:
+        check ^= byte
+    return check == frame[-1]
+
+
+def raw24(data: bytes, index: int) -> int:
+    base = index * 3
+    value = data[base] | (data[base + 1] << 8) | (data[base + 2] << 16)
+    if value & 0x800000:
+        value |= ~0xFFFFFF
+    return value
+
+
+def resolve_ft(raw: tuple[int, ...]) -> tuple[float, ...]:
+    gages = []
+    for index, value in enumerate(raw):
+        net_gage = (float(value) - ADC_ZERO_CODE[index]) * ADC_CODE_TO_NET_GAUGE + NET_GAUGE_ZERO
+        gages.append(net_gage - GAUGE_OFFSET[index])
+    return tuple(sum(row[col] * gages[col] for col in range(RAW_CHANNELS)) for row in FT_MATRIX)
+
+
 @dataclass
 class Sample:
     timestamp_s: float
+    seq: int
+    raw: tuple[int, ...]
     ft: tuple[float, ...]
-    ft_filtered: tuple[float, ...]
 
 
 class SampleBuffer:
-    def __init__(self, seconds: float = WINDOW_SECONDS, rate_hz: float = DEFAULT_RATE_HZ) -> None:
+    def __init__(self, seconds: float = WINDOW_SECONDS, rate_hz: float = SAMPLE_RATE_HZ) -> None:
         self.samples: deque[Sample] = deque(maxlen=max(1000, int(seconds * rate_hz)))
         self.lock = threading.Lock()
 
@@ -164,13 +209,17 @@ class SampleBuffer:
         with self.lock:
             return list(self.samples)
 
+    def display_snapshot(self) -> list[Sample]:
+        with self.lock:
+            return list(self.samples)[::DISPLAY_DECIMATE]
+
     def clear(self) -> None:
         with self.lock:
             self.samples.clear()
 
 
 class NotchFilter:
-    def __init__(self, freq_hz: float, sample_rate_hz: float = DEFAULT_RATE_HZ, q: float = NOTCH_Q) -> None:
+    def __init__(self, freq_hz: float, sample_rate_hz: float = DISPLAY_RATE_HZ, q: float = NOTCH_Q) -> None:
         w0 = 2.0 * math.pi * freq_hz / sample_rate_hz
         alpha = math.sin(w0) / (2.0 * q)
         a0 = 1.0 + alpha
@@ -217,8 +266,8 @@ class SerialReader(threading.Thread):
         self.ser: serial.Serial | None = None
         self.current_port = port_hint
         self.buffer = bytearray()
-        self.wrap_offset_us = 0
-        self.last_timestamp_us: int | None = None
+        self.last_seq: int | None = None
+        self.missing = 0
         self.ft_filters = [
             [NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS
         ]
@@ -231,8 +280,8 @@ class SerialReader(threading.Thread):
     def reset_stream(self) -> None:
         self.samples.clear()
         self.buffer.clear()
-        self.wrap_offset_us = 0
-        self.last_timestamp_us = None
+        self.last_seq = None
+        self.missing = 0
         self.reset_filters()
 
     def connect(self) -> bool:
@@ -275,7 +324,7 @@ class SerialReader(threading.Thread):
                 time.sleep(0.5)
                 continue
             try:
-                chunk = self.ser.read(4096)
+                chunk = self.ser.read(65536)
             except (serial.SerialException, OSError) as exc:
                 if self.stop_event.is_set():
                     break
@@ -289,47 +338,45 @@ class SerialReader(threading.Thread):
             self._parse_buffer()
 
     def _parse_buffer(self) -> None:
-        while len(self.buffer) >= PACKET_SIZE:
-            if self.buffer[0] != 0x5A or self.buffer[1] != 0xA5:
+        while len(self.buffer) >= BLOCK_SIZE:
+            if self.buffer[:4] != SYNC_BYTES:
+                index = self.buffer.find(SYNC_BYTES, 1)
+                if index < 0:
+                    del self.buffer[:-3]
+                    break
+                del self.buffer[:index]
+                continue
+
+            frame = bytes(self.buffer[:BLOCK_SIZE])
+            if not block_valid(frame):
                 del self.buffer[0]
                 continue
 
-            frame = bytes(self.buffer[:PACKET_SIZE])
-            checksum = 0
-            for value in frame[:-1]:
-                checksum ^= value
-            if checksum != frame[-1]:
-                del self.buffer[0]
-                continue
-
-            sync, timestamp_us, *values, _ = PACKET.unpack(frame)
+            sync, seq, raw_block, _checksum = BLOCK.unpack(frame)
             if sync == SYNC:
-                if self.last_timestamp_us is not None:
-                    if timestamp_us < self.last_timestamp_us:
-                        if self.last_timestamp_us >= WRAP_HIGH_US and timestamp_us <= WRAP_LOW_US:
-                            self.wrap_offset_us += 1 << 32
-                        else:
-                            self.samples.clear()
-                            self.wrap_offset_us = 0
-                            self.reset_filters()
-                    elif timestamp_us - self.last_timestamp_us > MAX_FORWARD_JUMP_US:
+                if self.last_seq is not None:
+                    expected = self.last_seq + 1
+                    if seq < expected:
+                        self.samples.clear()
                         self.reset_filters()
-                self.last_timestamp_us = timestamp_us
-                full_timestamp_s = (self.wrap_offset_us + timestamp_us) / 1e6
-                ft_filtered = list(values)
-                for index, value in enumerate(ft_filtered):
-                    for filt in self.ft_filters[index]:
-                        value = filt.step(value)
-                    ft_filtered[index] = value
-                self.samples.append(
-                    Sample(
-                        timestamp_s=full_timestamp_s,
-                        ft=tuple(values),
-                        ft_filtered=tuple(ft_filtered),
+                    elif seq > expected:
+                        self.missing += seq - expected
+                for offset in range(SAMPLES_PER_BLOCK):
+                    sample_seq = seq + offset
+                    start = offset * RAW_BYTES
+                    raw_bytes = raw_block[start:start + RAW_BYTES]
+                    raw = tuple(raw24(raw_bytes, index) for index in range(RAW_CHANNELS))
+                    self.samples.append(
+                        Sample(
+                            timestamp_s=sample_seq / SAMPLE_RATE_HZ,
+                            seq=sample_seq,
+                            raw=raw,
+                            ft=resolve_ft(raw),
+                        )
                     )
-                )
+                self.last_seq = seq + SAMPLES_PER_BLOCK - 1
 
-            del self.buffer[:PACKET_SIZE]
+            del self.buffer[:BLOCK_SIZE]
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -353,6 +400,9 @@ class PlotWindow:
         self.filter_ft = True
         self.zero_ft = [0.0] * len(FT_CHANNELS)
         self.auto_zero_pending = True
+        self.display_filters = [
+            [NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS
+        ]
 
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         self.win = QtWidgets.QWidget()
@@ -422,7 +472,23 @@ class PlotWindow:
         return FT_UNITS[index]
 
     def sample_values(self, sample: Sample) -> tuple[float, ...]:
-        return sample.ft_filtered if self.filter_ft else sample.ft
+        return sample.ft
+
+    def display_values(self, samples: list[Sample]) -> list[tuple[float, ...]]:
+        if not self.filter_ft:
+            return [sample.ft for sample in samples]
+        self.display_filters = [
+            [NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS
+        ]
+        values: list[tuple[float, ...]] = []
+        for sample in samples:
+            filtered = list(sample.ft)
+            for index, value in enumerate(filtered):
+                for filt in self.display_filters[index]:
+                    value = filt.step(value)
+                filtered[index] = value
+            values.append(tuple(filtered))
+        return values
 
     def zero_values(self) -> list[float]:
         return self.zero_ft
@@ -496,21 +562,20 @@ class PlotWindow:
             return
 
         header = ["timestamp_s"]
+        header.append("seq")
+        header.extend(f"adc_{index}" for index in range(RAW_CHANNELS))
         header.extend(f"{name}_raw" for name in FT_CHANNELS)
         header.extend(f"{name}_zeroed" for name in FT_CHANNELS)
-        header.extend(f"{name}_filtered" for name in FT_CHANNELS)
-        header.extend(f"{name}_filtered_zeroed" for name in FT_CHANNELS)
 
         with open(path, "w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)
             writer.writerow(header)
             for sample in samples:
                 writer.writerow(
-                    [f"{sample.timestamp_s:.6f}"]
+                    [f"{sample.timestamp_s:.8f}", sample.seq]
+                    + list(sample.raw)
                     + [f"{value:.3f}" for value in sample.ft]
                     + [f"{value - zero:.3f}" for value, zero in zip(sample.ft, self.zero_ft)]
-                    + [f"{value:.3f}" for value in sample.ft_filtered]
-                    + [f"{value - zero:.3f}" for value, zero in zip(sample.ft_filtered, self.zero_ft)]
                 )
 
         self.last_message = f"saved {len(samples)} samples"
@@ -522,7 +587,10 @@ class PlotWindow:
             except queue.Empty:
                 break
 
-        samples = self.paused_samples if self.paused_samples is not None else self.samples.snapshot()
+        if self.paused_samples is not None:
+            samples = self.paused_samples[::DISPLAY_DECIMATE]
+        else:
+            samples = self.samples.display_snapshot()
         port = self.reader.current_port or "searching"
         if not samples:
             for curve in self.curves:
@@ -543,9 +611,10 @@ class PlotWindow:
         xs = [sample.timestamp_s - start_s for sample in samples]
         latest = samples[-1]
         zero = self.zero_values()
+        values = self.display_values(samples)
 
         for index, curve in enumerate(self.curves):
-            ys = [self.sample_values(sample)[index] - zero[index] for sample in samples]
+            ys = [value[index] - zero[index] for value in values]
             curve.setData(xs, ys)
 
         rate_hz = 0.0
@@ -555,13 +624,13 @@ class PlotWindow:
             if dt > 0:
                 rate_hz = (len(window) - 1) / dt
 
-        latest_values = self.sample_values(latest)
+        latest_values = values[-1]
         latest_text = " ".join(
             f"{name}={value - offset:+.3f}{self.current_unit(index)}"
             for index, (name, value, offset) in enumerate(zip(self.current_names(), latest_values, zero))
         )
         self.status.setText(
-            f"port={port} | rate={rate_hz:.1f} Hz | {latest_text} | {self.last_message}"
+            f"port={port} | plot={rate_hz:.1f} Hz save=32 kSPS missing={self.reader.missing} | {latest_text} | {self.last_message}"
         )
 
     def exec(self) -> int:
@@ -570,6 +639,8 @@ class PlotWindow:
 
 def open_serial(port: str) -> serial.Serial:
     ser = serial.Serial(port=port, baudrate=BAUD, timeout=0.05)
+    ser.dtr = False
+    ser.rts = False
     time.sleep(0.2)
     ser.reset_input_buffer()
     return ser
