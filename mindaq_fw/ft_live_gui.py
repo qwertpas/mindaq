@@ -37,6 +37,7 @@ FT_UNITS = ["N", "N", "N", "Nm", "Nm", "Nm"]
 SAMPLE_RATE_HZ = 32_000.0
 DISPLAY_RATE_HZ = 1000.0
 DISPLAY_DECIMATE = int(SAMPLE_RATE_HZ / DISPLAY_RATE_HZ)
+MIN_DISPLAY_SAMPLES = 250
 RAW_CHANNELS = 6
 SAMPLES_PER_BLOCK = 64
 RAW_BYTES = RAW_CHANNELS * 3
@@ -51,21 +52,21 @@ NOTCH_FREQS = (60.0, 120.0)
 USB_PORT_PREFIXES = ("/dev/cu.usbmodem", "/dev/tty.usbmodem", "/dev/ttyACM", "/dev/ttyUSB", "COM")
 ADC_CODE_TO_NET_GAUGE = 0.016
 NET_GAUGE_ZERO = 32768.0
-ADC_ZERO_CODE = (-521738.0, -153570.0, -334040.0, 26775.0, -317685.0, -7511.0)
-GAUGE_OFFSET = (25212.0, 29526.0, 23086.0, 28152.0, 24516.0, 33182.0)
+ADC_ZERO_CODE = (-389970.6, -69628.7, -468145.8, -62856.2, -320894.1, -7240.5)
+GAUGE_OFFSET = (23086.0, 28152.0, 25212.0, 29526.0, 24516.0, 33182.0)
+GAUGE_SCALE = (0.934640523, 0.939244663, 1.036231884, 1.041894353, 1.184265010, 0.912280702)
 FT_MATRIX = (
-    (9.575586391247820e-06, 5.034719323341890e-04, 2.827122413565440e-05,
-     -5.179287349565690e-04, -6.054530989079390e-06, -2.075418832354940e-05),
-    (-1.038902452683050e-07, -2.775572866673270e-04, 8.796242351000440e-06,
-     -3.247148267647300e-04, -2.520127206219610e-05, 6.348497973460170e-04),
-    (5.498814948547810e-04, 4.982665178403360e-05, 5.962241921681900e-04,
-     1.831416126079740e-05, 4.950476642689660e-04, 4.274870927968580e-05),
-    (-3.124957530622520e-06, 1.381712094274260e-06, 3.204207898418680e-06,
-     2.084386424212550e-06, 2.577052836577890e-07, -3.830766465429980e-06),
-    (1.741821139441800e-06, 3.219636663939340e-06, 2.229410518476670e-06,
-     -3.070929538864320e-06, -3.172020201011310e-06, -4.085733997308220e-07),
-    (2.397902398001370e-08, 2.162107308175090e-06, -7.705459896268520e-08,
-     2.297459226084220e-06, -9.943845273683800e-08, 2.240688262268020e-06),
+    (-2.827122413565440e-05, 5.179287349565690e-04, -9.575586391247820e-06,
+     -5.034719323341890e-04, 6.054530989079390e-06, 2.075418832354940e-05),
+    (8.796242351000440e-06, -3.247148267647300e-04, -1.038902452683050e-07,
+     -2.775572866673270e-04, -2.520127206219610e-05, 6.348497973460170e-04),
+    (5.993160239162e-04, 0.0, 5.434076606576e-04, 0.0, 4.838318054700e-04, 0.0),
+    (-3.204207898418680e-06, -2.084386424212550e-06, 3.124957530622520e-06,
+     -1.381712094274260e-06, -2.577052836577890e-07, 3.830766465429980e-06),
+    (2.229410518476670e-06, -3.070929538864320e-06, 1.741821139441800e-06,
+     3.219636663939340e-06, -3.172020201011310e-06, -4.085733997308220e-07),
+    (-7.705459896268520e-08, 2.297459226084220e-06, 2.397902398001370e-08,
+     2.162107308175090e-06, -9.943845273683800e-08, 2.240688262268020e-06),
 )
 
 
@@ -184,7 +185,7 @@ def resolve_ft(raw: tuple[int, ...]) -> tuple[float, ...]:
     gages = []
     for index, value in enumerate(raw):
         net_gage = (float(value) - ADC_ZERO_CODE[index]) * ADC_CODE_TO_NET_GAUGE + NET_GAUGE_ZERO
-        gages.append(net_gage - GAUGE_OFFSET[index])
+        gages.append((net_gage - GAUGE_OFFSET[index]) * GAUGE_SCALE[index])
     return tuple(sum(row[col] * gages[col] for col in range(RAW_CHANNELS)) for row in FT_MATRIX)
 
 
@@ -359,6 +360,7 @@ class SerialReader(threading.Thread):
                     if seq < expected:
                         self.samples.clear()
                         self.reset_filters()
+                        self.missing = 0
                     elif seq > expected:
                         self.missing += seq - expected
                 for offset in range(SAMPLES_PER_BLOCK):
@@ -397,7 +399,7 @@ class PlotWindow:
         self.last_message = "connecting"
         self.paused = False
         self.paused_samples: list[Sample] | None = None
-        self.filter_ft = True
+        self.filter_ft = False
         self.zero_ft = [0.0] * len(FT_CHANNELS)
         self.auto_zero_pending = True
         self.display_filters = [
@@ -431,7 +433,7 @@ class PlotWindow:
         self.zero_button.clicked.connect(self.zero_all)
         button_row.addWidget(self.zero_button)
 
-        self.filter_button = QtWidgets.QPushButton("60 Hz Filter On")
+        self.filter_button = QtWidgets.QPushButton("60 Hz Filter Off")
         self.filter_button.clicked.connect(self.toggle_filter)
         button_row.addWidget(self.filter_button)
 
@@ -592,11 +594,13 @@ class PlotWindow:
         else:
             samples = self.samples.display_snapshot()
         port = self.reader.current_port or "searching"
-        if not samples:
+        if len(samples) < MIN_DISPLAY_SAMPLES:
             for curve in self.curves:
                 curve.setData([], [])
             self.auto_zero_pending = True
-            self.status.setText(f"port={port} | {self.last_message}")
+            self.status.setText(
+                f"port={port} | loading real stream {len(samples)}/{MIN_DISPLAY_SAMPLES} | {self.last_message}"
+            )
             return
 
         if self.auto_zero_pending:
@@ -639,8 +643,8 @@ class PlotWindow:
 
 def open_serial(port: str) -> serial.Serial:
     ser = serial.Serial(port=port, baudrate=BAUD, timeout=0.05)
-    ser.dtr = False
-    ser.rts = False
+    ser.dtr = True
+    ser.rts = True
     time.sleep(0.2)
     ser.reset_input_buffer()
     return ser

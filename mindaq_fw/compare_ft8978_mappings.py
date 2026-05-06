@@ -11,13 +11,13 @@ AXES = ("Fx", "Fy", "Fz", "Tx", "Ty", "Tz")
 FORCE = 1.0
 TORQUE = 0.01
 XML_PATH = Path("calibration/FT8978 Net.xml")
-GAUGE_ORDER = np.array([0, 3, 2, 5, 4, 1])
-FT8978_MAIN_ROWS = np.array([0, 1, 2, 4, 3, 5])
-FT8978_MAIN_SIGNS = np.array([-1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
-FT8978_BEST_ROWS = (0, 1, 2, 3, 4, 5)
-FT8978_BEST_ROW_SIGNS = (-1, 1, 1, -1, 1, 1)
-FT8978_BEST_COLS = (2, 3, 4, 5, 0, 1)
-FT8978_BEST_COL_SIGNS = (1, 1, 1, 1, 1, 1)
+FT8978_FW_COLS = np.array([4, 5, 2, 3, 0, 1])
+FT8978_FW_SIGNS = np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+FT8978_FW_SCALES = np.array(
+    [0.934640523, 0.939244663, 1.036231884, 1.041894353, 1.184265010, 0.912280702]
+)
+FT8978_REORDERED_COLS = np.array([2, 3, 4, 5, 0, 1])
+FT8978_REORDERED_SIGNS = np.array([-1.0, 1.0, 1.0, -1.0, 1.0, 1.0])
 
 FT_SCALE = np.array(
     [
@@ -98,29 +98,23 @@ def resolve_matrix() -> np.ndarray:
     return matrix
 
 
-def main_cpp_ft8978_matrix(xml: np.ndarray) -> np.ndarray:
-    return (xml[FT8978_MAIN_ROWS] * FT8978_MAIN_SIGNS[:, None])[:, GAUGE_ORDER]
+def firmware_matrix(xml: np.ndarray) -> np.ndarray:
+    return (xml * FT8978_FW_SIGNS[:, None])[:, FT8978_FW_COLS] * FT8978_FW_SCALES[None, :]
+
+
+def reordered_matrix(xml: np.ndarray) -> np.ndarray:
+    return (xml * FT8978_REORDERED_SIGNS[:, None])[:, FT8978_REORDERED_COLS]
 
 
 def convention_matrix(name: str, xml: np.ndarray) -> np.ndarray:
     if name == "resolve":
         return resolve_matrix()
-    if name == "ft8978_main":
-        return main_cpp_ft8978_matrix(xml)
-    if name == "ft8978_best":
-        return convention_from_parts(
-            xml,
-            FT8978_BEST_ROWS,
-            FT8978_BEST_ROW_SIGNS,
-            FT8978_BEST_COLS,
-            FT8978_BEST_COL_SIGNS,
-        )
-    if name == "ft8978_no_double_order":
-        return main_cpp_ft8978_matrix(xml)
+    if name == "firmware":
+        return firmware_matrix(xml)
+    if name == "bad_reordered":
+        return reordered_matrix(xml)
     if name == "ft8978_xml_raw":
         return xml
-    if name == "ft8978_xml_ordered":
-        return xml[:, GAUGE_ORDER]
     raise ValueError(f"unknown mapping {name}")
 
 
@@ -259,7 +253,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--xml", type=Path, default=XML_PATH)
     parser.add_argument("--a", default="resolve")
-    parser.add_argument("--b", default="ft8978_main")
+    parser.add_argument("--b", default="firmware")
     parser.add_argument("--force", type=float, default=FORCE)
     parser.add_argument("--torque", type=float, default=TORQUE)
     parser.add_argument("--matrices", action="store_true")
@@ -275,11 +269,9 @@ def main() -> None:
     args = parse_args()
     names = (
         "resolve",
-        "ft8978_best",
-        "ft8978_main",
-        "ft8978_no_double_order",
+        "firmware",
+        "bad_reordered",
         "ft8978_xml_raw",
-        "ft8978_xml_ordered",
     )
     if args.list:
         print("\n".join(names))
