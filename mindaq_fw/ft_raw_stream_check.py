@@ -12,23 +12,34 @@ CHANNELS = 6
 SAMPLES_PER_BLOCK = 64
 RAW_BYTES = CHANNELS * 3
 BLOCK = struct.Struct(f"<II{SAMPLES_PER_BLOCK * RAW_BYTES}sB")
-ADC_CODE_TO_NET_GAUGE = 0.016
-NET_GAUGE_ZERO = 32768.0
-ADC_ZERO_CODE = (-389970.6, -69628.7, -468145.8, -62856.2, -320894.1, -7240.5)
-GAUGE_OFFSET = (23086.0, 28152.0, 25212.0, 29526.0, 24516.0, 33182.0)
-GAUGE_SCALE = (0.934640523, 0.939244663, 1.036231884, 1.041894353, 1.184265010, 0.912280702)
-FT_MATRIX = (
-    (-2.827122413565440e-05, 5.179287349565690e-04, -9.575586391247820e-06,
-     -5.034719323341890e-04, 6.054530989079390e-06, 2.075418832354940e-05),
-    (8.796242351000440e-06, -3.247148267647300e-04, -1.038902452683050e-07,
-     -2.775572866673270e-04, -2.520127206219610e-05, 6.348497973460170e-04),
-    (5.993160239162e-04, 0.0, 5.434076606576e-04, 0.0, 4.838318054700e-04, 0.0),
-    (-3.204207898418680e-06, -2.084386424212550e-06, 3.124957530622520e-06,
-     -1.381712094274260e-06, -2.577052836577890e-07, 3.830766465429980e-06),
-    (2.229410518476670e-06, -3.070929538864320e-06, 1.741821139441800e-06,
-     3.219636663939340e-06, -3.172020201011310e-06, -4.085733997308220e-07),
-    (-7.705459896268520e-08, 2.297459226084220e-06, 2.397902398001370e-08,
-     2.162107308175090e-06, -9.943845273683800e-08, 2.240688262268020e-06),
+# ADC settings: signed 24-bit code at gain 8 with a 1.2 V reference.
+ADC_COUNT_TO_MICROVOLT = (1.2e6 / 8.0) / 8388608.0
+# Measured no-load ADC means in ADC port order.
+RAW_ZERO_CODE = (-995095.6, -358128.7, -940395.8, -265481.2, -836644.1, 18634.5)
+# ADC microvolt deltas -> ATI XML gauge order [g0,g1,g2,g3,g4,g5].
+# Nonzero locations encode wiring: port0->g4, port1->g5, port2->g2, port3->g3, port4->g0, port5->g1.
+# Nonzero values include the working ADC-count-to-NetFT-gauge bridge and XML GaugeGains normalization.
+ADC_UV_TO_ATI_GAUGE = (
+    (0.0, 0.0, 0.0, 0.0, 1.059662393280649e+00, 0.0),
+    (0.0, 0.0, 0.0, 0.0, 0.0, 8.162949541379004e-01),
+    (0.0, 0.0, 9.272045943442637e-01, 0.0, 0.0, 0.0),
+    (0.0, 0.0, 0.0, 9.322712858379332e-01, 0.0, 0.0),
+    (8.363021832919449e-01, 0.0, 0.0, 0.0, 0.0, 0.0),
+    (0.0, 8.404218980265711e-01, 0.0, 0.0, 0.0, 0.0),
+)
+# ATI XML gauge order -> [Fx,Fy,Fz,Tx,Ty,Tz]. Only Fz is fitted; other rows are factory XML.
+ATI_GAUGE_TO_FT = (
+    (6.054530989079390e-06, 2.075418832354940e-05, -9.575586391247820e-06,
+     -5.034719323341890e-04, -2.827122413565440e-05, 5.179287349565690e-04),
+    (-2.520127206219610e-05, 6.348497973460170e-04, -1.038902452683050e-07,
+     -2.775572866673270e-04, 8.796242351000440e-06, -3.247148267647300e-04),
+    (4.838318054700e-04, 0.0, 5.434076606576e-04, 0.0, 5.993160239162e-04, 0.0),
+    (-2.577052836577890e-07, 3.830766465429980e-06, 3.124957530622520e-06,
+     -1.381712094274260e-06, -3.204207898418680e-06, -2.084386424212550e-06),
+    (-3.172020201011310e-06, -4.085733997308220e-07, 1.741821139441800e-06,
+     3.219636663939340e-06, 2.229410518476670e-06, -3.070929538864320e-06),
+    (-9.943845273683800e-08, 2.240688262268020e-06, 2.397902398001370e-08,
+     2.162107308175090e-06, -7.705459896268520e-08, 2.297459226084220e-06),
 )
 
 
@@ -48,11 +59,12 @@ def raw24(data: bytes, index: int) -> int:
 
 
 def resolve_ft(raw: tuple[int, ...]) -> tuple[float, ...]:
-    gages = []
-    for index, value in enumerate(raw):
-        net_gage = (float(value) - ADC_ZERO_CODE[index]) * ADC_CODE_TO_NET_GAUGE + NET_GAUGE_ZERO
-        gages.append((net_gage - GAUGE_OFFSET[index]) * GAUGE_SCALE[index])
-    return tuple(sum(row[col] * gages[col] for col in range(CHANNELS)) for row in FT_MATRIX)
+    adc_uv = tuple((float(value) - RAW_ZERO_CODE[index]) * ADC_COUNT_TO_MICROVOLT
+                   for index, value in enumerate(raw))
+    ati_gage = tuple(sum(row[col] * adc_uv[col] for col in range(CHANNELS))
+                    for row in ADC_UV_TO_ATI_GAUGE)
+    return tuple(sum(row[col] * ati_gage[col] for col in range(CHANNELS))
+                 for row in ATI_GAUGE_TO_FT)
 
 
 def main() -> int:
@@ -64,7 +76,7 @@ def main() -> int:
 
     with serial.Serial(args.port, baudrate=args.baud, timeout=0.05) as ser:
         ser.dtr = True
-        ser.rts = True
+        ser.rts = False
         time.sleep(0.3)
         ser.reset_input_buffer()
 

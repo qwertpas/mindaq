@@ -63,31 +63,45 @@ constexpr uint16_t kNegColor = ST77XX_RED;
 constexpr uint16_t kTextColor = ST77XX_WHITE;
 constexpr uint16_t kZeroColor = ST77XX_YELLOW;
 
-constexpr float kAdcCodeToNetGauge = 0.016f;
-constexpr float kNetGaugeZero = 32768.0f;
-constexpr float kAdcZeroCode[kChannels] = {
-    -389970.6f, -69628.7f, -468145.8f, -62856.2f, -320894.1f, -7240.5f,
+// ADC settings: ADS output is signed 24-bit code at gain 8 with a 1.2 V reference.
+constexpr float kAdcCountToMicrovolt = (1.2e6f / static_cast<float>(1 << kGainCode)) / 8388608.0f;
+
+// Measured no-load ADC means in ADC port order: [port0, port1, port2, port3, port4, port5].
+constexpr float kRawZeroCode[kChannels] = {
+    -995095.6f, -358128.7f, -940395.8f, -265481.2f, -836644.1f, 18634.5f,
 };
-constexpr float kGaugeOffset[kChannels] = {
-    23086.0f, 28152.0f, 25212.0f, 29526.0f, 24516.0f, 33182.0f,
+
+// Converts ADC microvolt deltas to ATI XML gauge order [g0, g1, g2, g3, g4, g5].
+// Nonzero locations are the measured wiring:
+// port0->g4, port1->g5, port2->g2, port3->g3, port4->g0, port5->g1.
+// Nonzero values are the working ADC-count-to-NetFT-gauge bridge (0.016 count/count)
+// plus XML GaugeGains normalization from calibration/FT8978 Net.xml.
+constexpr float kAdcUvToAtiGauge[kChannels][kChannels] = {
+    {0.0f, 0.0f, 0.0f, 0.0f, 1.059662393280649e+00f, 0.0f},
+    {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 8.162949541379004e-01f},
+    {0.0f, 0.0f, 9.272045943442637e-01f, 0.0f, 0.0f, 0.0f},
+    {0.0f, 0.0f, 0.0f, 9.322712858379332e-01f, 0.0f, 0.0f},
+    {8.363021832919449e-01f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f},
+    {0.0f, 8.404218980265711e-01f, 0.0f, 0.0f, 0.0f, 0.0f},
 };
-constexpr float kGaugeScale[kChannels] = {
-    0.934640523f, 0.939244663f, 1.036231884f, 1.041894353f, 1.184265010f,
-    0.912280702f,
-};
-constexpr float kFtMatrix[kChannels][kChannels] = {
-    {-2.827122413565440e-05f, 5.179287349565690e-04f, -9.575586391247820e-06f,
-     -5.034719323341890e-04f, 6.054530989079390e-06f, 2.075418832354940e-05f},
-    {8.796242351000440e-06f, -3.247148267647300e-04f, -1.038902452683050e-07f,
-     -2.775572866673270e-04f, -2.520127206219610e-05f, 6.348497973460170e-04f},
-    {5.993160239162e-04f, 0.0f, 5.434076606576e-04f, 0.0f, 4.838318054700e-04f,
+
+// ATI XML gauge order [g0, g1, g2, g3, g4, g5] to [Fx,Fy,Fz,Tx,Ty,Tz].
+// Rows other than Fz are from calibration/FT8978 Net.xml, normalized by CountsPerForce
+// and CountsPerTorque. Fz is the only fitted row, constrained to the ideal sparse
+// normal-gauge pattern and fitted from 41 500 g plate-placement captures.
+constexpr float kAtiGaugeToFt[kChannels][kChannels] = {
+    {6.054530989079390e-06f, 2.075418832354940e-05f, -9.575586391247820e-06f,
+     -5.034719323341890e-04f, -2.827122413565440e-05f, 5.179287349565690e-04f},
+    {-2.520127206219610e-05f, 6.348497973460170e-04f, -1.038902452683050e-07f,
+     -2.775572866673270e-04f, 8.796242351000440e-06f, -3.247148267647300e-04f},
+    {4.838318054700e-04f, 0.0f, 5.434076606576e-04f, 0.0f, 5.993160239162e-04f,
      0.0f},
-    {-3.204207898418680e-06f, -2.084386424212550e-06f, 3.124957530622520e-06f,
-     -1.381712094274260e-06f, -2.577052836577890e-07f, 3.830766465429980e-06f},
-    {2.229410518476670e-06f, -3.070929538864320e-06f, 1.741821139441800e-06f,
-     3.219636663939340e-06f, -3.172020201011310e-06f, -4.085733997308220e-07f},
-    {-7.705459896268520e-08f, 2.297459226084220e-06f, 2.397902398001370e-08f,
-     2.162107308175090e-06f, -9.943845273683800e-08f, 2.240688262268020e-06f},
+    {-2.577052836577890e-07f, 3.830766465429980e-06f, 3.124957530622520e-06f,
+     -1.381712094274260e-06f, -3.204207898418680e-06f, -2.084386424212550e-06f},
+    {-3.172020201011310e-06f, -4.085733997308220e-07f, 1.741821139441800e-06f,
+     3.219636663939340e-06f, 2.229410518476670e-06f, -3.070929538864320e-06f},
+    {-9.943845273683800e-08f, 2.240688262268020e-06f, 2.397902398001370e-08f,
+     2.162107308175090e-06f, -7.705459896268520e-08f, 2.297459226084220e-06f},
 };
 constexpr float kDisplayFullScale[kChannels] = {
     12.0f, 12.0f, 17.0f, 0.12f, 0.12f, 0.12f,
@@ -341,16 +355,24 @@ void serialTask(void *param) {
 }
 
 void resolveFt(const int32_t raw[kChannels], float ft[kChannels]) {
-  float gages[kChannels];
+  float adc_uv[kChannels];
   for (size_t i = 0; i < kChannels; ++i) {
-    const float net_gage =
-        (static_cast<float>(raw[i]) - kAdcZeroCode[i]) * kAdcCodeToNetGauge + kNetGaugeZero;
-    gages[i] = (net_gage - kGaugeOffset[i]) * kGaugeScale[i];
+    adc_uv[i] = (static_cast<float>(raw[i]) - kRawZeroCode[i]) * kAdcCountToMicrovolt;
   }
+
+  float ati_gage[kChannels];
   for (size_t row = 0; row < kChannels; ++row) {
     float value = 0.0f;
     for (size_t col = 0; col < kChannels; ++col) {
-      value += kFtMatrix[row][col] * gages[col];
+      value += kAdcUvToAtiGauge[row][col] * adc_uv[col];
+    }
+    ati_gage[row] = value;
+  }
+
+  for (size_t row = 0; row < kChannels; ++row) {
+    float value = 0.0f;
+    for (size_t col = 0; col < kChannels; ++col) {
+      value += kAtiGaugeToFt[row][col] * ati_gage[col];
     }
     ft[row] = value;
   }
