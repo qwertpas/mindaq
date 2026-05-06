@@ -13,6 +13,7 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from glob import glob
+from os import name as os_name
 
 import serial
 
@@ -30,7 +31,7 @@ except ImportError as exc:
     ) from exc
 
 BAUD = 2_000_000
-SERIAL_PORT = "/dev/cu.usbmodem1101"
+SERIAL_PORT = None
 FT_CHANNELS = ["Fx", "Fy", "Fz", "Tx", "Ty", "Tz"]
 FT_UNITS = ["N", "N", "N", "Nm", "Nm", "Nm"]
 PACKET = struct.Struct("<HI6fB")
@@ -44,7 +45,7 @@ WRAP_LOW_US = 10_000_000
 WRAP_HIGH_US = 0xF0000000
 NOTCH_Q = 10.0
 NOTCH_FREQS = (60.0, 120.0)
-USB_PORT_PREFIXES = ("/dev/cu.usbmodem", "/dev/tty.usbmodem", "/dev/ttyACM", "/dev/ttyUSB")
+USB_PORT_PREFIXES = ("/dev/cu.usbmodem", "/dev/tty.usbmodem", "/dev/ttyACM", "/dev/ttyUSB", "COM")
 
 
 def plot_position(index: int) -> tuple[int, int]:
@@ -52,9 +53,13 @@ def plot_position(index: int) -> tuple[int, int]:
 
 
 def find_serial_port(pattern: str | None) -> str | None:
-    if pattern is None:
-        pattern = SERIAL_PORT
     if pattern:
+        if os_name == "nt" and pattern.upper().startswith("COM"):
+            return pattern
+        if list_ports is not None:
+            for port_info in list_ports.comports():
+                if port_info.device == pattern:
+                    return pattern
         matches = sorted(glob(pattern))
         if matches:
             for match in matches:
@@ -220,12 +225,15 @@ class SerialReader(threading.Thread):
         self.connected = False
         self.port_lock = threading.Lock()
 
+    def reset_filters(self) -> None:
+        self.ft_filters = [[NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS]
+
     def reset_stream(self) -> None:
         self.samples.clear()
         self.buffer.clear()
         self.wrap_offset_us = 0
         self.last_timestamp_us = None
-        self.ft_filters = [[NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS]
+        self.reset_filters()
 
     def connect(self) -> bool:
         with self.port_lock:
@@ -301,11 +309,11 @@ class SerialReader(threading.Thread):
                         if self.last_timestamp_us >= WRAP_HIGH_US and timestamp_us <= WRAP_LOW_US:
                             self.wrap_offset_us += 1 << 32
                         else:
-                            del self.buffer[0]
-                            continue
+                            self.samples.clear()
+                            self.wrap_offset_us = 0
+                            self.reset_filters()
                     elif timestamp_us - self.last_timestamp_us > MAX_FORWARD_JUMP_US:
-                        del self.buffer[0]
-                        continue
+                        self.reset_filters()
                 self.last_timestamp_us = timestamp_us
                 full_timestamp_s = (self.wrap_offset_us + timestamp_us) / 1e6
                 ft_filtered = list(values)

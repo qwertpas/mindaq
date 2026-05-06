@@ -877,8 +877,9 @@ constexpr uint32_t kSpiClockHz = 8000000;
 constexpr uint8_t kFrameWords = 10;
 constexpr uint8_t kActiveChannels = 6;
 constexpr uint16_t kPacketSync = 0xA55A;
-constexpr bool kAutoGain = true; // set to true to automatically select gain on start up
-constexpr uint8_t kFixedGainCode = 7;
+constexpr bool kAutoGain = false;
+// Gain 8 leaves about +/-131 mV before the firmware clip threshold.
+constexpr uint8_t kFixedGainCode = 3;
 
 constexpr uint8_t kAdcSclkPin = 10;
 constexpr uint8_t kAdcMisoPin = 9;
@@ -904,8 +905,10 @@ constexpr uint8_t kChCfgRegs[kActiveChannels] = {0x09, 0x0E, 0x13, 0x18, 0x1D, 0
 
 constexpr uint16_t kModeValue = 0x0110;
 constexpr uint16_t kClockValue = 0x3FD2;
-constexpr uint16_t kGain1Value = 0x7777;
-constexpr uint16_t kGain2Value = 0x0077;
+constexpr uint16_t kGain1Value = static_cast<uint16_t>(
+    (kFixedGainCode << 12) | (kFixedGainCode << 8) | (kFixedGainCode << 4) |
+    kFixedGainCode);
+constexpr uint16_t kGain2Value = static_cast<uint16_t>((kFixedGainCode << 4) | kFixedGainCode);
 
 constexpr uint16_t kNullCommand = 0x0000;
 constexpr uint32_t kResetPulseUs = 20;
@@ -931,15 +934,31 @@ constexpr uint16_t kNegColor = ST77XX_RED;
 constexpr uint16_t kTextColor = ST77XX_WHITE;
 constexpr uint16_t kZeroColor = ST77XX_YELLOW;
 
-// Fitted from calibration/FT8978 Net.xml onto the existing geometric basis so
-// the live axis conventions stay aligned with the current board wiring.
-constexpr float kFtScale[kActiveChannels] = {
-    5.242261206577384e-4f,
-    6.711481094720999e-4f,
-    1.491585028973418e-3f,
-    3.382662814280309e-6f,
-    3.926013399015233e-6f,
-    5.998476015074367e-6f,
+constexpr float kAdcCodeToNetGauge = 0.016f;
+constexpr float kNetGaugeZero = 32768.0f;
+constexpr float kAdcZeroCode[kActiveChannels] = {
+    -521738.0f, -153570.0f, -334040.0f, 26775.0f, -317685.0f, -7511.0f,
+};
+
+// calibration/FT8978 Net.xml, remapped to the board wiring convention that
+// best matches the geometric resolver direction.
+constexpr float kFtMatrix[kActiveChannels][kActiveChannels] = {
+    {9.575586391247820e-06f, 5.034719323341890e-04f, 2.827122413565440e-05f,
+     -5.179287349565690e-04f, -6.054530989079390e-06f, -2.075418832354940e-05f},
+    {-1.038902452683050e-07f, -2.775572866673270e-04f, 8.796242351000440e-06f,
+     -3.247148267647300e-04f, -2.520127206219610e-05f, 6.348497973460170e-04f},
+    {5.498814948547810e-04f, 4.982665178403360e-05f, 5.962241921681900e-04f,
+     1.831416126079740e-05f, 4.950476642689660e-04f, 4.274870927968580e-05f},
+    {-3.124957530622520e-06f, 1.381712094274260e-06f, 3.204207898418680e-06f,
+     2.084386424212550e-06f, 2.577052836577890e-07f, -3.830766465429980e-06f},
+    {1.741821139441800e-06f, 3.219636663939340e-06f, 2.229410518476670e-06f,
+     -3.070929538864320e-06f, -3.172020201011310e-06f, -4.085733997308220e-07f},
+    {2.397902398001370e-08f, 2.162107308175090e-06f, -7.705459896268520e-08f,
+     2.297459226084220e-06f, -9.943845273683800e-08f, 2.240688262268020e-06f},
+};
+
+constexpr float kGaugeOffset[kActiveChannels] = {
+    25212.0f, 29526.0f, 23086.0f, 28152.0f, 24516.0f, 33182.0f,
 };
 
 constexpr float kDisplayFullScale[kActiveChannels] = {
@@ -1209,7 +1228,7 @@ DisplaySnapshot display_snapshot;
 
 bool adc_ready = false;
 InputMode input_mode = InputMode::External;
-uint8_t gain_code = 6; //7
+uint8_t gain_code = kFixedGainCode;
 char command_buffer[32];
 uint8_t command_length = 0;
 uint32_t last_init_attempt_ms = 0;
@@ -1219,26 +1238,23 @@ uint32_t zero_count = 0;
 double zero_sum[kActiveChannels] = {};
 float zero_offset[kActiveChannels] = {};
 bool zero_done = false;
+bool raw_requested = false;
+bool debug_requested = false;
 
-float codeToUv() {
-  const float gain = static_cast<float>(1 << gain_code);
-  const float full_scale_volts = 1.2f / gain;
-  return (full_scale_volts * 1.0e6f) / 8388608.0f;
-}
-
-void g(const float gages[kActiveChannels], float ft[kActiveChannels]) {
-  const float g0 = gages[0];
-  const float g1 = gages[1];
-  const float g2 = gages[2];
-  const float g3 = gages[3];
-  const float g4 = gages[4];
-  const float g5 = gages[5];
-  ft[0] = 0.5f * (g1 - g3) * kFtScale[0];
-  ft[1] = 0.25f * (-g1 - g3 + 2.0f * g5) * kFtScale[1];
-  ft[2] = 0.25f * (g0 + g2 + 2.0f * g4) * kFtScale[2];
-  ft[3] = 0.5f * (g2 - g0) * kFtScale[3];
-  ft[4] = 0.25f * (g0 + g2 - 2.0f * g4) * kFtScale[4];
-  ft[5] = 0.25f * (g1 + g3 + 2.0f * g5) * kFtScale[5];
+void resolveFt(const int32_t raw[kActiveChannels], float ft[kActiveChannels]) {
+  float gages[kActiveChannels];
+  for (size_t i = 0; i < kActiveChannels; ++i) {
+    const float net_gage =
+        (static_cast<float>(raw[i]) - kAdcZeroCode[i]) * kAdcCodeToNetGauge + kNetGaugeZero;
+    gages[i] = net_gage - kGaugeOffset[i];
+  }
+  for (size_t row = 0; row < kActiveChannels; ++row) {
+    float value = 0.0f;
+    for (size_t col = 0; col < kActiveChannels; ++col) {
+      value += kFtMatrix[row][col] * gages[col];
+    }
+    ft[row] = value;
+  }
 }
 
 void setDisplayStatus(DisplayStatus status, uint16_t zero_progress = 0) {
@@ -1275,12 +1291,9 @@ void updateDisplayData(const float ft_in[kActiveChannels], float ft_out[kActiveC
   float ft[kActiveChannels];
   for (size_t i = 0; i < kActiveChannels; ++i) {
     ft[i] = ft_in[i];
-    ft_out[i] = 0.0f;
+    ft_out[i] = ft[i];
   }
-  if (!zero_done) {
-    if (zero_start_ms == 0) {
-      resetZeroing();
-    }
+  if (zero_start_ms != 0) {
     for (size_t i = 0; i < kActiveChannels; ++i) {
       zero_sum[i] += ft[i];
     }
@@ -1293,6 +1306,7 @@ void updateDisplayData(const float ft_in[kActiveChannels], float ft_out[kActiveC
         ft_out[i] = ft[i];
       }
       zero_done = true;
+      zero_start_ms = 0;
       publishDisplayValues(ft, DisplayStatus::Ready, 1000);
       return;
     }
@@ -1303,7 +1317,9 @@ void updateDisplayData(const float ft_in[kActiveChannels], float ft_out[kActiveC
   }
 
   for (size_t i = 0; i < kActiveChannels; ++i) {
-    ft[i] -= zero_offset[i];
+    if (zero_done) {
+      ft[i] -= zero_offset[i];
+    }
     ft_out[i] = ft[i];
   }
   publishDisplayValues(ft, DisplayStatus::Ready, 1000);
@@ -1451,6 +1467,32 @@ void handleCommand(const char *command) {
   }
   if (strcmp(command, "status") == 0) {
     writeStatusLine("status");
+    return;
+  }
+  if (strcmp(command, "zero") == 0) {
+    resetZeroing();
+    writeLine("zeroing");
+    return;
+  }
+  if (strcmp(command, "clearzero") == 0) {
+    zero_start_ms = 0;
+    zero_count = 0;
+    zero_done = false;
+    for (size_t i = 0; i < kActiveChannels; ++i) {
+      zero_sum[i] = 0.0;
+      zero_offset[i] = 0.0f;
+    }
+    writeLine("zero cleared");
+    return;
+  }
+  if (strcmp(command, "raw") == 0) {
+    raw_requested = true;
+    writeLine("raw requested");
+    return;
+  }
+  if (strcmp(command, "debug") == 0) {
+    debug_requested = true;
+    writeLine("debug requested");
     return;
   }
   writeLine("unknown command");
@@ -1682,7 +1724,6 @@ void loop() {
           delay(10);
           return;
         }
-        resetZeroing();
         writeLine("adc ready");
         Serial.print("# gain=");
         Serial.println(1 << gain_code);
@@ -1704,13 +1745,33 @@ void loop() {
   TelemetryPacket packet{};
   packet.sync = kPacketSync;
   packet.timestamp_us = micros();
-  float gages_uv[kActiveChannels];
-  const float code_to_uv = codeToUv();
-  for (size_t i = 0; i < kActiveChannels; ++i) {
-    gages_uv[i] = static_cast<float>(frame.raw[i]) * code_to_uv;
-  }
   float ft[kActiveChannels];
-  resolveFt(gages_uv, ft);
+  resolveFt(frame.raw, ft);
+  if (raw_requested || debug_requested) {
+    raw_requested = false;
+    Serial.print("# raw");
+    for (size_t i = 0; i < kActiveChannels; ++i) {
+      Serial.print(' ');
+      Serial.print(frame.raw[i]);
+    }
+    Serial.println();
+    if (debug_requested) {
+      debug_requested = false;
+      Serial.print("# ft");
+      for (size_t i = 0; i < kActiveChannels; ++i) {
+        Serial.print(' ');
+        Serial.print(ft[i], 6);
+      }
+      Serial.println();
+      Serial.print("# zero");
+      Serial.print(zero_done ? " 1" : " 0");
+      for (size_t i = 0; i < kActiveChannels; ++i) {
+        Serial.print(' ');
+        Serial.print(zero_offset[i], 6);
+      }
+      Serial.println();
+    }
+  }
   for (size_t i = 0; i < kActiveChannels; ++i) {
     packet.ft[i] = ft[i];
   }
