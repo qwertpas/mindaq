@@ -11,11 +11,11 @@ SAMPLE_RATE_HZ = 32_000.0
 CHANNELS = 6
 SAMPLES_PER_BLOCK = 64
 RAW_BYTES = CHANNELS * 3
-BLOCK = struct.Struct(f"<II{SAMPLES_PER_BLOCK * RAW_BYTES}sB")
-# ADC settings: signed 24-bit code at gain 8 with a 1.2 V reference.
-ADC_COUNT_TO_MICROVOLT = (1.2e6 / 8.0) / 8388608.0
+BLOCK = struct.Struct(f"<II{SAMPLES_PER_BLOCK * RAW_BYTES}sBBBB")
+DEFAULT_GAIN_CODE = 3
 # Measured no-load ADC means in ADC port order.
 RAW_ZERO_CODE = (-995095.6, -358128.7, -940395.8, -265481.2, -836644.1, 18634.5)
+ADC_FULL_SCALE = 0x7FFFFF
 # ADC microvolt deltas -> ATI XML gauge order [g0,g1,g2,g3,g4,g5].
 # Nonzero locations encode wiring: port0->g4, port1->g5, port2->g2, port3->g3, port4->g0, port5->g1.
 # Nonzero values include the working ADC-count-to-NetFT-gauge bridge and XML GaugeGains normalization.
@@ -43,6 +43,13 @@ ATI_GAUGE_TO_FT = (
 )
 
 
+def count_to_microvolt(gain_code: int) -> float:
+    return (1.2e6 / float(1 << gain_code)) / 8388608.0
+
+
+RAW_ZERO_MICROVOLT = tuple(value * count_to_microvolt(DEFAULT_GAIN_CODE) for value in RAW_ZERO_CODE)
+
+
 def valid(frame: bytes) -> bool:
     check = 0
     for byte in frame[:-1]:
@@ -58,8 +65,8 @@ def raw24(data: bytes, index: int) -> int:
     return value
 
 
-def resolve_ft(raw: tuple[int, ...]) -> tuple[float, ...]:
-    adc_uv = tuple((float(value) - RAW_ZERO_CODE[index]) * ADC_COUNT_TO_MICROVOLT
+def resolve_ft(raw: tuple[int, ...], gain_code: int = DEFAULT_GAIN_CODE) -> tuple[float, ...]:
+    adc_uv = tuple(float(value) * count_to_microvolt(gain_code) - RAW_ZERO_MICROVOLT[index]
                    for index, value in enumerate(raw))
     ati_gage = tuple(sum(row[col] * adc_uv[col] for col in range(CHANNELS))
                     for row in ADC_UV_TO_ATI_GAUGE)
@@ -71,13 +78,17 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", default="/dev/cu.usbmodem101")
     parser.add_argument("--seconds", type=float, default=10.0)
+    parser.add_argument("--drain-seconds", type=float, default=2.0)
     parser.add_argument("--baud", type=int, default=2_000_000)
     args = parser.parse_args()
 
     with serial.Serial(args.port, baudrate=args.baud, timeout=0.05) as ser:
         ser.dtr = True
         ser.rts = False
-        time.sleep(0.3)
+        time.sleep(0.2)
+        drain_end = time.monotonic() + args.drain_seconds
+        while time.monotonic() < drain_end:
+            ser.read(65536)
         ser.reset_input_buffer()
 
         scan = bytearray()
@@ -118,6 +129,9 @@ def main() -> int:
     first_seq = None
     last_seq = None
     latest_raw_bytes = None
+    latest_gain_code = DEFAULT_GAIN_CODE
+    warn_flags = 0
+    clip_flags = 0
     resets = 0
     pos = 0
     while pos + BLOCK.size <= len(capture):
@@ -132,7 +146,7 @@ def main() -> int:
             bad += 1
             continue
 
-        sync, seq, raw_block, _checksum = BLOCK.unpack(frame)
+        sync, seq, raw_block, gain_code, block_warn_flags, block_clip_flags, _checksum = BLOCK.unpack(frame)
         if sync != SYNC:
             pos += 1
             bad += 1
@@ -154,6 +168,9 @@ def main() -> int:
                 missing += seq - expected
         last_seq = seq
         latest_raw_bytes = raw_block[-RAW_BYTES:]
+        latest_gain_code = gain_code
+        warn_flags |= block_warn_flags
+        clip_flags |= block_clip_flags
         samples += SAMPLES_PER_BLOCK
         pos += BLOCK.size
 
@@ -161,7 +178,7 @@ def main() -> int:
     stream_bytes = (samples // SAMPLES_PER_BLOCK) * BLOCK.size
     if latest_raw_bytes is not None:
         latest_raw = tuple(raw24(latest_raw_bytes, index) for index in range(CHANNELS))
-        latest_ft = resolve_ft(latest_raw)
+        latest_ft = resolve_ft(latest_raw, latest_gain_code)
     else:
         latest_raw = None
         latest_ft = None
@@ -178,8 +195,16 @@ def main() -> int:
     print(f"skipped_bytes={skipped}")
     print(f"bad_checksum={bad}")
     print(f"sequence_resets={resets}")
+    print(f"gain_code={latest_gain_code}")
+    print(f"gain=x{1 << latest_gain_code}")
+    print(f"warn_flags=0x{warn_flags:02X}")
+    print(f"clip_flags=0x{clip_flags:02X}")
     if latest_raw is not None and latest_ft is not None:
         print("raw=" + " ".join(str(value) for value in latest_raw))
+        print(
+            "raw_pct="
+            + " ".join(f"{abs(value) * 100.0 / ADC_FULL_SCALE:.1f}" for value in latest_raw)
+        )
         print(
             "ft="
             + " ".join(

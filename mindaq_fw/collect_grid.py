@@ -11,6 +11,7 @@ import serial
 from ft_raw_stream_check import (
     BLOCK,
     CHANNELS,
+    DEFAULT_GAIN_CODE,
     RAW_BYTES,
     SAMPLES_PER_BLOCK,
     SYNC,
@@ -33,16 +34,16 @@ POSITIONS = (
 )
 
 
-def parse_frame(frame: bytes) -> tuple[int, bytes] | None:
+def parse_frame(frame: bytes) -> tuple[int, bytes, int, int, int] | None:
     if not valid(frame):
         return None
-    sync, seq, raw_block, _checksum = BLOCK.unpack(frame)
+    sync, seq, raw_block, gain_code, warn_flags, clip_flags, _checksum = BLOCK.unpack(frame)
     if sync != SYNC:
         return None
-    return seq, raw_block
+    return seq, raw_block, gain_code, warn_flags, clip_flags
 
 
-def consume_frames(scan: bytearray) -> tuple[list[tuple[int, bytes]], int, int]:
+def consume_frames(scan: bytearray) -> tuple[list[tuple[int, bytes, int, int, int]], int, int]:
     frames = []
     bad = 0
     skipped = 0
@@ -98,6 +99,9 @@ def capture_average(
     skipped = 0
     first_seq = None
     last_seq = None
+    gain_code = DEFAULT_GAIN_CODE
+    warn_flags = 0
+    clip_flags = 0
     scan = bytearray()
     start = time.monotonic()
     end = start + seconds
@@ -110,7 +114,10 @@ def capture_average(
         if not frames:
             continue
 
-        for seq, raw_block in frames:
+        for seq, raw_block, block_gain_code, block_warn_flags, block_clip_flags in frames:
+            gain_code = block_gain_code
+            warn_flags |= block_warn_flags
+            clip_flags |= block_clip_flags
             if first_seq is None:
                 first_seq = seq
             elif last_seq is not None:
@@ -135,7 +142,10 @@ def capture_average(
     frames, frame_bad, frame_skipped = consume_frames(scan)
     bad += frame_bad
     skipped += frame_skipped
-    for seq, raw_block in frames:
+    for seq, raw_block, block_gain_code, block_warn_flags, block_clip_flags in frames:
+        gain_code = block_gain_code
+        warn_flags |= block_warn_flags
+        clip_flags |= block_clip_flags
         if first_seq is None:
             first_seq = seq
         elif last_seq is not None:
@@ -169,6 +179,9 @@ def capture_average(
         "missing_seq": missing,
         "bad_checksum": bad,
         "skipped_bytes": skipped,
+        "gain_code": gain_code,
+        "warn_flags": warn_flags,
+        "clip_flags": clip_flags,
     }
     means = []
     for index in range(CHANNELS):
@@ -178,7 +191,7 @@ def capture_average(
         row[f"raw{index}_sd"] = math.sqrt(var)
         means.append(round(mean))
 
-    fx, fy, fz, tx, ty, tz = resolve_ft(tuple(means))
+    fx, fy, fz, tx, ty, tz = resolve_ft(tuple(means), gain_code)
     row.update({"Fx": fx, "Fy": fy, "Fz": fz, "Tx": tx, "Ty": ty, "Tz": tz})
     return row
 
@@ -205,7 +218,7 @@ def main() -> int:
     fields = (
         "capture_index", "position", "x_sign", "y_sign", "timestamp", "elapsed_s", "samples",
         "sample_rate_hz", "first_seq", "last_seq", "seq_rate_hz", "missing_seq", "bad_checksum",
-        "skipped_bytes",
+        "skipped_bytes", "gain_code", "warn_flags", "clip_flags",
         "raw0_mean", "raw1_mean", "raw2_mean", "raw3_mean", "raw4_mean", "raw5_mean",
         "raw0_sd", "raw1_sd", "raw2_sd", "raw3_sd", "raw4_sd", "raw5_sd",
         "Fx", "Fy", "Fz", "Tx", "Ty", "Tz",
@@ -216,7 +229,7 @@ def main() -> int:
         "w", newline=""
     ) as file:
         ser.dtr = True
-        ser.rts = True
+        ser.rts = False
         time.sleep(0.3)
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
@@ -252,6 +265,7 @@ def main() -> int:
                 f"saved {name}: samples={row['samples']} "
                 f"rate={row['sample_rate_hz']:.0f}Hz seq_rate={row['seq_rate_hz']:.0f}Hz "
                 f"missing={row['missing_seq']} "
+                f"gain=x{1 << int(row['gain_code'])} sat=0x{int(row['warn_flags']):02X}/0x{int(row['clip_flags']):02X} "
                 f"raw={[round(row[f'raw{i}_mean']) for i in range(CHANNELS)]} "
                 f"ft=({row['Fx']:+.3f}, {row['Fy']:+.3f}, {row['Fz']:+.3f}, "
                 f"{row['Tx']:+.4f}, {row['Ty']:+.4f}, {row['Tz']:+.4f})"

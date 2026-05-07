@@ -43,7 +43,7 @@ SAMPLES_PER_BLOCK = 64
 RAW_BYTES = RAW_CHANNELS * 3
 SYNC = 0xA55AA55A
 SYNC_BYTES = b"\x5a\xa5\x5a\xa5"
-BLOCK = struct.Struct(f"<II{SAMPLES_PER_BLOCK * RAW_BYTES}sB")
+BLOCK = struct.Struct(f"<II{SAMPLES_PER_BLOCK * RAW_BYTES}sBBBB")
 BLOCK_SIZE = BLOCK.size
 SERIAL_READ_SIZE = 65536
 STARTUP_DRAIN_MIN_SECONDS = 0.35
@@ -53,8 +53,9 @@ COLORS = ["#ff6b35", "#f39c12", "#27ae60", "#2980b9", "#8e44ad", "#c0392b"]
 NOTCH_Q = 10.0
 NOTCH_FREQS = (60.0, 120.0)
 USB_PORT_PREFIXES = ("/dev/cu.usbmodem", "/dev/tty.usbmodem", "/dev/ttyACM", "/dev/ttyUSB", "COM")
-# ADC settings: signed 24-bit code at gain 8 with a 1.2 V reference.
-ADC_COUNT_TO_MICROVOLT = (1.2e6 / 8.0) / 8388608.0
+GAIN_LABELS = ("x1", "x2", "x4", "x8", "x16", "x32")
+DEFAULT_GAIN_CODE = 3
+ADC_FULL_SCALE = 0x7FFFFF
 # Measured no-load ADC means in ADC port order.
 RAW_ZERO_CODE = (-995095.6, -358128.7, -940395.8, -265481.2, -836644.1, 18634.5)
 # ADC microvolt deltas -> ATI XML gauge order [g0,g1,g2,g3,g4,g5].
@@ -82,6 +83,13 @@ ATI_GAUGE_TO_FT = (
     (-9.943845273683800e-08, 2.240688262268020e-06, 2.397902398001370e-08,
      2.162107308175090e-06, -7.705459896268520e-08, 2.297459226084220e-06),
 )
+
+
+def count_to_microvolt(gain_code: int) -> float:
+    return (1.2e6 / float(1 << gain_code)) / 8388608.0
+
+
+RAW_ZERO_MICROVOLT = tuple(value * count_to_microvolt(DEFAULT_GAIN_CODE) for value in RAW_ZERO_CODE)
 
 
 def plot_position(index: int) -> tuple[int, int]:
@@ -195,8 +203,8 @@ def raw24(data: bytes, index: int) -> int:
     return value
 
 
-def resolve_ft(raw: tuple[int, ...]) -> tuple[float, ...]:
-    adc_uv = tuple((float(value) - RAW_ZERO_CODE[index]) * ADC_COUNT_TO_MICROVOLT
+def resolve_ft(raw: tuple[int, ...], gain_code: int = DEFAULT_GAIN_CODE) -> tuple[float, ...]:
+    adc_uv = tuple(float(value) * count_to_microvolt(gain_code) - RAW_ZERO_MICROVOLT[index]
                    for index, value in enumerate(raw))
     ati_gage = tuple(sum(row[col] * adc_uv[col] for col in range(RAW_CHANNELS))
                     for row in ADC_UV_TO_ATI_GAUGE)
@@ -208,6 +216,9 @@ def resolve_ft(raw: tuple[int, ...]) -> tuple[float, ...]:
 class Sample:
     timestamp_s: float
     seq: int
+    gain_code: int
+    warn_flags: int
+    clip_flags: int
     raw: tuple[int, ...]
     ft: tuple[float, ...]
 
@@ -284,6 +295,7 @@ class SerialReader(threading.Thread):
         self.buffer = bytearray()
         self.last_seq: int | None = None
         self.missing = 0
+        self.gain_code = DEFAULT_GAIN_CODE
         self.ft_filters = [
             [NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS
         ]
@@ -387,8 +399,9 @@ class SerialReader(threading.Thread):
                 del self.buffer[0]
                 continue
 
-            sync, seq, raw_block, _checksum = BLOCK.unpack(frame)
+            sync, seq, raw_block, gain_code, warn_flags, clip_flags, _checksum = BLOCK.unpack(frame)
             if sync == SYNC:
+                self.gain_code = gain_code
                 if self.last_seq is not None:
                     expected = self.last_seq + 1
                     if seq < expected:
@@ -406,8 +419,11 @@ class SerialReader(threading.Thread):
                         Sample(
                             timestamp_s=sample_seq / SAMPLE_RATE_HZ,
                             seq=sample_seq,
+                            gain_code=gain_code,
+                            warn_flags=warn_flags,
+                            clip_flags=clip_flags,
                             raw=raw,
-                            ft=resolve_ft(raw),
+                            ft=resolve_ft(raw, gain_code),
                         )
                     )
                 self.last_seq = seq + SAMPLES_PER_BLOCK - 1
@@ -423,6 +439,20 @@ class SerialReader(threading.Thread):
             self.port_hint = port_hint
             self.current_port = port_hint
         self.disconnect()
+
+    def set_gain_code(self, gain_code: int) -> bool:
+        if gain_code < 0 or gain_code >= len(GAIN_LABELS):
+            return False
+        if self.ser is None:
+            self.messages.put("gain command needs connected board")
+            return False
+        try:
+            self.ser.write(f"gain {gain_code}\n".encode("ascii"))
+        except (serial.SerialException, OSError) as exc:
+            self.messages.put(f"[serial error] {exc}")
+            self.disconnect()
+            return False
+        return True
 
 
 class PlotWindow:
@@ -470,6 +500,14 @@ class PlotWindow:
         self.filter_button = QtWidgets.QPushButton("60 Hz Filter Off")
         self.filter_button.clicked.connect(self.toggle_filter)
         button_row.addWidget(self.filter_button)
+
+        button_row.addWidget(QtWidgets.QLabel("Gain"))
+        self.gain_box = QtWidgets.QComboBox()
+        for code, label in enumerate(GAIN_LABELS):
+            self.gain_box.addItem(label, code)
+        self.gain_box.setCurrentIndex(DEFAULT_GAIN_CODE)
+        self.gain_box.currentIndexChanged.connect(self.change_gain)
+        button_row.addWidget(self.gain_box)
 
         self.save_button = QtWidgets.QPushButton("Save CSV")
         self.save_button.clicked.connect(self.save_csv)
@@ -553,6 +591,20 @@ class PlotWindow:
         self.auto_zero_pending = True
         self.last_message = f"port={'auto' if port_hint is None else port_hint}"
 
+    def change_gain(self) -> None:
+        gain_code = self.gain_box.currentData()
+        if gain_code is None:
+            return
+        self.reader.set_gain_code(int(gain_code))
+        self.samples.clear()
+        self.reader.reset_filters()
+        self.display_filters = [
+            [NotchFilter(freq_hz) for freq_hz in NOTCH_FREQS] for _ in FT_CHANNELS
+        ]
+        self.paused_samples = None
+        self.auto_zero_pending = False
+        self.last_message = "gain changed; re-zero if needed"
+
     def toggle_filter(self) -> None:
         self.filter_ft = not self.filter_ft
         self.filter_button.setText("60 Hz Filter On" if self.filter_ft else "60 Hz Filter Off")
@@ -599,6 +651,7 @@ class PlotWindow:
 
         header = ["timestamp_s"]
         header.append("seq")
+        header.extend(["gain_code", "warn_flags", "clip_flags"])
         header.extend(f"adc_{index}" for index in range(RAW_CHANNELS))
         header.extend(f"{name}_raw" for name in FT_CHANNELS)
         header.extend(f"{name}_zeroed" for name in FT_CHANNELS)
@@ -609,6 +662,7 @@ class PlotWindow:
             for sample in samples:
                 writer.writerow(
                     [f"{sample.timestamp_s:.8f}", sample.seq]
+                    + [sample.gain_code, sample.warn_flags, sample.clip_flags]
                     + list(sample.raw)
                     + [f"{value:.3f}" for value in sample.ft]
                     + [f"{value - zero:.3f}" for value, zero in zip(sample.ft, self.zero_ft)]
@@ -631,7 +685,6 @@ class PlotWindow:
         if len(samples) < MIN_DISPLAY_SAMPLES:
             for curve in self.curves:
                 curve.setData([], [])
-            self.auto_zero_pending = True
             self.status.setText(
                 f"port={port} | loading real stream {len(samples)}/{MIN_DISPLAY_SAMPLES} | {self.last_message}"
             )
@@ -667,8 +720,25 @@ class PlotWindow:
             f"{name}={value - offset:+.3f}{self.current_unit(index)}"
             for index, (name, value, offset) in enumerate(zip(self.current_names(), latest_values, zero))
         )
+        warn_flags = 0
+        clip_flags = 0
+        headroom = [0.0] * RAW_CHANNELS
+        for sample in samples:
+            warn_flags |= sample.warn_flags
+            clip_flags |= sample.clip_flags
+            for index, value in enumerate(sample.raw):
+                headroom[index] = max(headroom[index], abs(value) * 100.0 / ADC_FULL_SCALE)
+        sat_parts = []
+        if clip_flags:
+            sat_parts.append("SAT CLIP " + ",".join(f"ch{i}" for i in range(RAW_CHANNELS) if clip_flags & (1 << i)))
+        warn_only = warn_flags & ~clip_flags
+        if warn_only:
+            sat_parts.append("SAT WARN " + ",".join(f"ch{i}" for i in range(RAW_CHANNELS) if warn_only & (1 << i)))
+        sat_text = " | " + " ".join(sat_parts) if sat_parts else ""
+        raw_pct = "/".join(f"{value:.0f}" for value in headroom)
         self.status.setText(
-            f"port={port} | plot={rate_hz:.1f} Hz save=32 kSPS missing={self.reader.missing} | {latest_text} | {self.last_message}"
+            f"port={port} | gain={GAIN_LABELS[latest.gain_code]} raw%={raw_pct}{sat_text} | "
+            f"plot={rate_hz:.1f} Hz save=32 kSPS missing={self.reader.missing} | {latest_text} | {self.last_message}"
         )
 
     def exec(self) -> int:
@@ -678,7 +748,7 @@ class PlotWindow:
 def open_serial(port: str) -> serial.Serial:
     ser = serial.Serial(port=port, baudrate=BAUD, timeout=0.05)
     ser.dtr = True
-    ser.rts = True
+    ser.rts = False
     time.sleep(0.2)
     ser.reset_input_buffer()
     return ser

@@ -50,10 +50,12 @@ constexpr uint16_t kGain1Reg = 0x04;
 constexpr uint16_t kGain2Reg = 0x05;
 constexpr uint16_t kModeValue = 0x0110;
 constexpr uint16_t kClockValue32k = 0x3FC2;
-constexpr uint8_t kGainCode = 3;
-constexpr uint16_t kGain1Value =
-    (kGainCode << 12) | (kGainCode << 8) | (kGainCode << 4) | kGainCode;
-constexpr uint16_t kGain2Value = (kGainCode << 4) | kGainCode;
+constexpr uint8_t kDefaultGainCode = 3;
+constexpr uint8_t kMaxGainCode = 5;
+constexpr int32_t kAdcFullScale = 0x7FFFFF;
+constexpr int32_t kAdcWarnCode = static_cast<int32_t>(static_cast<float>(kAdcFullScale) * 0.85f);
+constexpr int32_t kAdcClipCode = static_cast<int32_t>(static_cast<float>(kAdcFullScale) * 0.98f);
+constexpr uint8_t kSettleDiscardFrames = 16;
 
 constexpr uint16_t kBgColor = ST77XX_BLACK;
 constexpr uint16_t kBorderColor = ST77XX_WHITE;
@@ -63,12 +65,21 @@ constexpr uint16_t kNegColor = ST77XX_RED;
 constexpr uint16_t kTextColor = ST77XX_WHITE;
 constexpr uint16_t kZeroColor = ST77XX_YELLOW;
 
-// ADC settings: ADS output is signed 24-bit code at gain 8 with a 1.2 V reference.
-constexpr float kAdcCountToMicrovolt = (1.2e6f / static_cast<float>(1 << kGainCode)) / 8388608.0f;
+constexpr float countToMicrovolt(uint8_t gain_code) {
+  return (1.2e6f / static_cast<float>(1u << gain_code)) / 8388608.0f;
+}
 
 // Measured no-load ADC means in ADC port order: [port0, port1, port2, port3, port4, port5].
 constexpr float kRawZeroCode[kChannels] = {
     -995095.6f, -358128.7f, -940395.8f, -265481.2f, -836644.1f, 18634.5f,
+};
+constexpr float kRawZeroMicrovolt[kChannels] = {
+    kRawZeroCode[0] * countToMicrovolt(kDefaultGainCode),
+    kRawZeroCode[1] * countToMicrovolt(kDefaultGainCode),
+    kRawZeroCode[2] * countToMicrovolt(kDefaultGainCode),
+    kRawZeroCode[3] * countToMicrovolt(kDefaultGainCode),
+    kRawZeroCode[4] * countToMicrovolt(kDefaultGainCode),
+    kRawZeroCode[5] * countToMicrovolt(kDefaultGainCode),
 };
 
 // Converts ADC microvolt deltas to ATI XML gauge order [g0, g1, g2, g3, g4, g5].
@@ -117,18 +128,24 @@ enum class DisplayStatus : uint8_t {
 struct __attribute__((packed)) Sample {
   uint32_t seq;
   uint8_t raw[kChannels * 3];
+  uint8_t gain_code;
+  uint8_t warn_flags;
+  uint8_t clip_flags;
 };
 
 struct __attribute__((packed)) Block {
   uint32_t sync;
   uint32_t seq;
   uint8_t raw[kSamplesPerBlock][kChannels * 3];
+  uint8_t gain_code;
+  uint8_t warn_flags;
+  uint8_t clip_flags;
   uint8_t checksum;
 };
 
 struct DisplaySnapshot {
   float values[kChannels] = {};
-  uint8_t gain_code = kGainCode;
+  uint8_t gain_code = kDefaultGainCode;
   DisplayStatus status = DisplayStatus::Boot;
   uint16_t zero_progress = 0;
 };
@@ -140,11 +157,15 @@ Block block = {};
 volatile uint32_t write_index = 0;
 volatile uint32_t read_index = 0;
 uint32_t seq = 0;
+volatile uint8_t current_gain_code = kDefaultGainCode;
+volatile uint8_t requested_gain_code = kDefaultGainCode;
+volatile bool output_paused = false;
 SPIClass tft_spi(HSPI);
 Adafruit_ST7789 tft(&tft_spi, kTftCsPin, kTftDcPin, kTftRstPin);
 portMUX_TYPE latest_lock = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE display_lock = portMUX_INITIALIZER_UNLOCKED;
 int32_t latest_raw[kChannels] = {};
+uint8_t latest_gain_code = kDefaultGainCode;
 bool latest_ready = false;
 DisplaySnapshot display_snapshot;
 uint32_t zero_start_ms = 0;
@@ -159,6 +180,15 @@ uint16_t rreg(uint8_t address) {
 
 uint16_t wreg(uint8_t address) {
   return 0x6000u | (static_cast<uint16_t>(address) << 7);
+}
+
+uint16_t gain1Value(uint8_t gain_code) {
+  return (static_cast<uint16_t>(gain_code) << 12) | (static_cast<uint16_t>(gain_code) << 8) |
+         (static_cast<uint16_t>(gain_code) << 4) | gain_code;
+}
+
+uint16_t gain2Value(uint8_t gain_code) {
+  return (static_cast<uint16_t>(gain_code) << 4) | gain_code;
 }
 
 void putCommand(uint16_t command) {
@@ -226,6 +256,11 @@ bool writeRegister(uint8_t address, uint16_t value) {
   return static_cast<uint16_t>(word24(0) >> 8) == static_cast<uint16_t>(0x4000u | (address << 7));
 }
 
+bool writeGainRegisters(uint8_t gain_code) {
+  return writeRegister(kGain1Reg, gain1Value(gain_code)) &&
+         writeRegister(kGain2Reg, gain2Value(gain_code));
+}
+
 bool readRegister(uint8_t address, uint16_t &value) {
   putCommand(rreg(address));
   if (!transfer()) {
@@ -242,6 +277,10 @@ bool readRegister(uint8_t address, uint16_t &value) {
 void startStreamSpi() {
   memset(tx, 0, sizeof(tx));
   SPI.beginTransaction(SPISettings(kSpiClockHz, MSBFIRST, SPI_MODE1));
+}
+
+void stopStreamSpi() {
+  SPI.endTransaction();
 }
 
 bool readStreamFrame() {
@@ -263,21 +302,92 @@ uint8_t blockChecksum(const Block &block) {
   return value;
 }
 
+uint8_t saturationFlag(int32_t value, int32_t threshold) {
+  const int32_t magnitude = value < 0 ? -value : value;
+  return magnitude >= threshold ? 1 : 0;
+}
+
 void fillSample(Sample &sample, uint32_t sample_seq) {
   sample.seq = sample_seq;
+  sample.gain_code = current_gain_code;
+  sample.warn_flags = 0;
+  sample.clip_flags = 0;
   for (size_t ch = 0; ch < kChannels; ++ch) {
     const uint32_t value = word24(ch + 1);
     sample.raw[ch * 3 + 0] = static_cast<uint8_t>(value & 0xFF);
     sample.raw[ch * 3 + 1] = static_cast<uint8_t>((value >> 8) & 0xFF);
     sample.raw[ch * 3 + 2] = static_cast<uint8_t>((value >> 16) & 0xFF);
+    const int32_t raw = signExtend24(value);
+    sample.warn_flags |= saturationFlag(raw, kAdcWarnCode) << ch;
+    sample.clip_flags |= saturationFlag(raw, kAdcClipCode) << ch;
   }
   if ((sample_seq & 0x1F) == 0) {
     portENTER_CRITICAL(&latest_lock);
     for (size_t ch = 0; ch < kChannels; ++ch) {
       latest_raw[ch] = signExtend24(rawLe24(&sample.raw[ch * 3]));
     }
+    latest_gain_code = sample.gain_code;
     latest_ready = true;
     portEXIT_CRITICAL(&latest_lock);
+  }
+}
+
+bool applyRequestedGain() {
+  const uint8_t gain_code = requested_gain_code;
+  if (gain_code == current_gain_code) {
+    return true;
+  }
+  output_paused = true;
+  vTaskDelay(1);
+  stopStreamSpi();
+  const bool ok = writeGainRegisters(gain_code);
+  startStreamSpi();
+  if (ok) {
+    current_gain_code = gain_code;
+    for (uint8_t i = 0; i < kSettleDiscardFrames; ++i) {
+      readStreamFrame();
+    }
+    write_index = 0;
+    read_index = 0;
+    seq = 0;
+    latest_ready = false;
+  } else {
+    requested_gain_code = current_gain_code;
+  }
+  output_paused = false;
+  return ok;
+}
+
+void handleCommand(char *command) {
+  if (strncmp(command, "gain ", 5) != 0) {
+    return;
+  }
+  char *end = nullptr;
+  const long value = strtol(command + 5, &end, 10);
+  if (end == command + 5 || value < 0 || value > kMaxGainCode) {
+    return;
+  }
+  requested_gain_code = static_cast<uint8_t>(value);
+}
+
+void pollSerialCommands() {
+  static char command[16] = {};
+  static uint8_t length = 0;
+  while (Serial.available() > 0) {
+    const char c = static_cast<char>(Serial.read());
+    if (c == '\n' || c == '\r') {
+      command[length] = '\0';
+      if (length > 0) {
+        handleCommand(command);
+      }
+      length = 0;
+      continue;
+    }
+    if (length + 1 < sizeof(command)) {
+      command[length++] = c;
+    } else {
+      length = 0;
+    }
   }
 }
 
@@ -287,6 +397,13 @@ void adcTask(void *param) {
   uint32_t next_sample_us = micros();
   uint16_t sample_phase = 0;
   while (true) {
+    if (requested_gain_code != current_gain_code) {
+      applyRequestedGain();
+      next_sample_us = micros();
+      sample_phase = 0;
+      continue;
+    }
+
     const int32_t wait_us = static_cast<int32_t>(next_sample_us - micros());
     if (wait_us > 0) {
       if (wait_us > 1000) {
@@ -325,6 +442,11 @@ void serialTask(void *param) {
   (void)param;
   uint32_t blocks_sent = 0;
   while (true) {
+    pollSerialCommands();
+    if (output_paused) {
+      taskYIELD();
+      continue;
+    }
     if (Serial.availableForWrite() < static_cast<int>(sizeof(Block))) {
       if (write_index - read_index > kRingSamples / 2) {
         read_index = write_index - kSamplesPerBlock;
@@ -341,8 +463,14 @@ void serialTask(void *param) {
 
     block.sync = kSync;
     block.seq = ring[read_index & kRingMask].seq;
+    block.gain_code = ring[read_index & kRingMask].gain_code;
+    block.warn_flags = 0;
+    block.clip_flags = 0;
     for (uint32_t i = 0; i < kSamplesPerBlock; ++i) {
-      memcpy(block.raw[i], ring[(read_index + i) & kRingMask].raw, kChannels * 3);
+      const Sample &sample = ring[(read_index + i) & kRingMask];
+      memcpy(block.raw[i], sample.raw, kChannels * 3);
+      block.warn_flags |= sample.warn_flags;
+      block.clip_flags |= sample.clip_flags;
     }
     block.checksum = blockChecksum(block);
     Serial.write(reinterpret_cast<const uint8_t *>(&block), sizeof(block));
@@ -354,10 +482,10 @@ void serialTask(void *param) {
   }
 }
 
-void resolveFt(const int32_t raw[kChannels], float ft[kChannels]) {
+void resolveFt(const int32_t raw[kChannels], uint8_t gain_code, float ft[kChannels]) {
   float adc_uv[kChannels];
   for (size_t i = 0; i < kChannels; ++i) {
-    adc_uv[i] = (static_cast<float>(raw[i]) - kRawZeroCode[i]) * kAdcCountToMicrovolt;
+    adc_uv[i] = static_cast<float>(raw[i]) * countToMicrovolt(gain_code) - kRawZeroMicrovolt[i];
   }
 
   float ati_gage[kChannels];
@@ -382,7 +510,7 @@ void setDisplayStatus(DisplayStatus status, uint16_t zero_progress = 0) {
   portENTER_CRITICAL(&display_lock);
   display_snapshot.status = status;
   display_snapshot.zero_progress = zero_progress;
-  display_snapshot.gain_code = kGainCode;
+  display_snapshot.gain_code = current_gain_code;
   portEXIT_CRITICAL(&display_lock);
 }
 
@@ -393,7 +521,7 @@ void publishDisplayValues(const float ft[kChannels], DisplayStatus status, uint1
   }
   display_snapshot.status = status;
   display_snapshot.zero_progress = zero_progress;
-  display_snapshot.gain_code = kGainCode;
+  display_snapshot.gain_code = current_gain_code;
   portEXIT_CRITICAL(&display_lock);
 }
 
@@ -563,17 +691,19 @@ void displayTask(void *param) {
 
   while (true) {
     int32_t raw[kChannels];
+    uint8_t gain_code = kDefaultGainCode;
     bool ready = false;
     portENTER_CRITICAL(&latest_lock);
     ready = latest_ready;
     for (size_t i = 0; i < kChannels; ++i) {
       raw[i] = latest_raw[i];
     }
+    gain_code = latest_gain_code;
     portEXIT_CRITICAL(&latest_lock);
 
     if (ready) {
       float ft[kChannels];
-      resolveFt(raw, ft);
+      resolveFt(raw, gain_code, ft);
       updateDisplayData(ft);
     }
 
@@ -653,8 +783,9 @@ bool initAdc() {
   resetAdc();
   if (!writeRegister(kModeReg, kModeValue)) return false;
   if (!writeRegister(kClockReg, kClockValue32k)) return false;
-  if (!writeRegister(kGain1Reg, kGain1Value)) return false;
-  if (!writeRegister(kGain2Reg, kGain2Value)) return false;
+  if (!writeGainRegisters(kDefaultGainCode)) return false;
+  current_gain_code = kDefaultGainCode;
+  requested_gain_code = kDefaultGainCode;
 
   uint16_t mode = 0;
   uint16_t clock = 0;
@@ -667,8 +798,8 @@ bool initAdc() {
 
   Serial.printf("# regs mode=0x%04X clock=0x%04X gain1=0x%04X gain2=0x%04X\n", mode, clock, gain1,
                 gain2);
-  return mode == kModeValue && clock == kClockValue32k && gain1 == kGain1Value &&
-         gain2 == kGain2Value;
+  return mode == kModeValue && clock == kClockValue32k && gain1 == gain1Value(kDefaultGainCode) &&
+         gain2 == gain2Value(kDefaultGainCode);
 }
 
 }  // namespace
