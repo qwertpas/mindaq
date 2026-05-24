@@ -91,5 +91,3 @@ For debugging:
 - `pos_channel`, `neg_channel`: selected ADC inputs.
 - `adc_N_uv`, `adc_N_raw`: per-channel microvolts and raw ADC counts, paired by channel.
 - `gain_code`, `warn_flags`, `clip_flags`: stream metadata.
-
-It then includes the same selected channel, per-ADC, gain, warning, and clipping metadata as the live CSV.
