@@ -3,7 +3,7 @@ import struct
 import serial
 import time
 
-SERIAL_PORT = "/dev/cu.usbmodem1101"
+SERIAL_PORT = "/dev/cu.usbmodem101"
 
 
 ''' Copy this to read force/torque from the serial port '''

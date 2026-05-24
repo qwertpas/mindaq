@@ -53,7 +53,7 @@ COLORS = ["#ff6b35", "#f39c12", "#27ae60", "#2980b9", "#8e44ad", "#c0392b"]
 NOTCH_Q = 10.0
 NOTCH_FREQS = (60.0, 120.0)
 USB_PORT_PREFIXES = ("/dev/cu.usbmodem", "/dev/tty.usbmodem", "/dev/ttyACM", "/dev/ttyUSB", "COM")
-GAIN_LABELS = ("x1", "x2", "x4", "x8", "x16", "x32")
+GAIN_LABELS = ("x1", "x2", "x4", "x8", "x16", "x32", "x64", "x128")
 DEFAULT_GAIN_CODE = 3
 ADC_FULL_SCALE = 0x7FFFFF
 # Measured no-load ADC means in ADC port order.
