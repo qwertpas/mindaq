@@ -15,36 +15,14 @@ Install python libraries if you don't have them:
 python3 -m pip install pyserial pyqtgraph PyQt5
 ```
 
-On Windows, use `py` if that is how Python is installed:
-
-```powershell
-py -3 -m pip install pyserial pyqtgraph PyQt5
-```
-
-
 Start the GUI:
 
 ```bash
 python3 capture_gui.py
 ```
 
-On Windows:
+If this does not work on Windows, try replacing `python3` in the above commands with `py -3`.
 
-```powershell
-py -3 capture_gui.py
-```
-
-The GUI normally finds the USB serial port automatically. To force a port:
-
-```bash
-python3 capture_gui.py --port /dev/cu.usbmodem101
-```
-
-On Windows:
-
-```powershell
-py -3 capture_gui.py --port COM3
-```
 
 ## Plots
 
