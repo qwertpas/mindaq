@@ -54,9 +54,8 @@ py -3 capture_gui.py --port COM3
 ## Buttons and Settings
 
 - Zeroing: Sets a baseline voltage as a 0 reading by subtracting the average voltage over the last 1 second.
-- Avg (1s): Text display of the average voltage over the last 1 second average after zeroing.
-- Live plot: shows the selected ADC voltage over the last 5 seconds. Data is displayed at 1 kHz.
-- Capture plot: shows the most recent trigger capture, aligned so GPIO pulse start is at time 0. Data is displayed at 1 kHz.
+- ADC + and ADC -: select the ADC channels to read from. If two channels are selected, the difference is used (useful for load cells).
+- Gain: sets the ADC amplifier gain between 1x and 128x. Higher gain means more sensitivity, but could saturate the reading if the voltage is too high (e.g. very high force applied). Check for saturation by looking at the raw% values or whether the live plot is clipping.
 - Trigger level: set in microvolts using the numeric field or vertical slider.
 - Delay: this amount of time after the trigger threshold crossing, the GPIO pulse starts and is used as the reference for when `capture_time_s` = 0.
 - Capture window: you can configure the time window to display and save before and after `capture_time_s` = 0. Default is -500ms to 0ms, meaning it saves and displays the last 500ms before the GPIO pulse start.
