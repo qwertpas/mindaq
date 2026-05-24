@@ -6,7 +6,7 @@ This GUI streams voltage data from the Mindaq, shows a live rolling plot, and re
 
 ## Usage
 
-Download [capture_gui.py](https://raw.githubusercontent.com/qwertpas/mindaq/main/scripts/capture/capture_gui.py).
+Download [capture_gui.py](https://raw.githubusercontent.com/qwertpas/mindaq/main/mindaq_fw/scripts/capture/capture_gui.py).
 
 
 Install python libraries if you don't have them:
