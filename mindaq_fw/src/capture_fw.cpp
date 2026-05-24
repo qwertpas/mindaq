@@ -27,6 +27,7 @@ constexpr uint8_t kAdcMosiPin = 8;
 constexpr uint8_t kAdcDrdyPin = 11;
 constexpr uint8_t kAdcCsPin = 12;
 constexpr uint8_t kAdcSyncPin = 13;
+constexpr uint8_t kTriggerLedPin = 48;
 
 constexpr uint16_t kModeReg = 0x02;
 constexpr uint16_t kClockReg = 0x03;
@@ -34,7 +35,7 @@ constexpr uint16_t kGain1Reg = 0x04;
 constexpr uint16_t kGain2Reg = 0x05;
 constexpr uint16_t kModeValue = 0x0110;
 constexpr uint16_t kClockValue32k = 0x3FC2;
-constexpr uint8_t kDefaultGainCode = 0;
+constexpr uint8_t kDefaultGainCode = 7;
 constexpr uint8_t kMaxGainCode = 7;
 constexpr int32_t kAdcFullScale = 0x7FFFFF;
 constexpr int32_t kAdcWarnCode = static_cast<int32_t>(static_cast<float>(kAdcFullScale) * 0.85f);
@@ -175,6 +176,7 @@ void stopTriggerOutput() {
   if (pin != 0) {
     digitalWrite(pin, LOW);
   }
+  digitalWrite(kTriggerLedPin, LOW);
 }
 
 void triggerWidthDone(void *arg) {
@@ -183,6 +185,7 @@ void triggerWidthDone(void *arg) {
   if (pin != 0) {
     digitalWrite(pin, LOW);
   }
+  digitalWrite(kTriggerLedPin, LOW);
 }
 
 void triggerDelayDone(void *arg) {
@@ -205,6 +208,7 @@ void fireTriggerPulse() {
   esp_timer_stop(trigger_delay_timer);
   esp_timer_stop(trigger_width_timer);
   digitalWrite(adc_trigger.pin, LOW);
+  digitalWrite(kTriggerLedPin, HIGH);
   trigger_pin = adc_trigger.pin;
   if (adc_trigger.delay_us == 0) {
     triggerDelayDone(nullptr);
@@ -662,6 +666,8 @@ void setup() {
   disableLoopWDT();
   disableCore0WDT();
   disableCore1WDT();
+  pinMode(kTriggerLedPin, OUTPUT);
+  digitalWrite(kTriggerLedPin, LOW);
   initTriggerTimers();
   Serial.println("# mindaq adc stream boot");
   while (!initAdc()) {
