@@ -2,7 +2,7 @@
 
 ![screenshot](pics/screenshot.jpg)
 
-This GUI streams ADC voltage data from the mindaq capture firmware, shows a live rolling plot, and records trigger-aligned captures like an oscilloscope. It can also pulse a GPIO pin a configurable delay after the trigger to align external devices (e.g. slow motion camera).
+This GUI streams voltage data from the Mindaq, shows a live rolling plot, and records trigger-aligned captures like an oscilloscope. It also pulses a GPIO pin a configurable delay after the trigger to align external devices (e.g. slow motion camera). Mindaq must be running the capture firmware.
 
 ## Usage
 
