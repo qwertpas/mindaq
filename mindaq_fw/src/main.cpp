@@ -824,6 +824,7 @@ void setup() {
                 kSync, static_cast<unsigned>(sizeof(Block)),
                 static_cast<unsigned>(kSamplesPerBlock), kChannels);
   delay(1000);
+  resetZeroing();
   xTaskCreatePinnedToCore(serialTask, "serial", kTaskStackBytes, nullptr, kSerialPriority, nullptr,
                           kSerialCore);
   xTaskCreatePinnedToCore(adcTask, "adc", kTaskStackBytes, nullptr, kAdcPriority, nullptr, kAdcCore);

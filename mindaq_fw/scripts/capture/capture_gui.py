@@ -15,6 +15,7 @@ from datetime import datetime
 from glob import glob
 from os import name as os_name
 
+import numpy as np
 import serial
 
 try:
@@ -57,13 +58,47 @@ DEFAULT_TRIGGER_LEVEL_UV = 100.0
 DEFAULT_TRIGGER_DELAY_MS = 200.0
 DEFAULT_CAPTURE_WINDOW_START_MS = -500.0
 DEFAULT_CAPTURE_WINDOW_END_MS = 0.0
+DEFAULT_UV_PER_N = 101.3232126
 TRIGGER_LOCKOUT_SECONDS = 1.0
 TRIGGER_LOCKOUT_SAMPLES = int(TRIGGER_LOCKOUT_SECONDS * SAMPLE_RATE_HZ)
 TRIGGER_SLIDER_STEPS = 10000
+DEFAULT_FIR_CUTOFF_HZ = 100.0
+MAX_FIR_CUTOFF_HZ = DISPLAY_RATE_HZ * 0.45
+FIR_TAPS = 63
+DEFAULT_POS_CHANNEL = 1
+DEFAULT_NEG_CHANNEL = 0
 
 
 def count_to_microvolt(gain_code: int) -> float:
     return (1.2e6 / float(1 << gain_code)) / 8388608.0
+
+
+def sample_rate(samples: list["Sample"]) -> float:
+    if len(samples) < 2:
+        return DISPLAY_RATE_HZ
+    seq_span = samples[-1].seq - samples[0].seq
+    if seq_span <= 0:
+        return DISPLAY_RATE_HZ
+    seq_step = max(1, int(round(seq_span / (len(samples) - 1))))
+    return SAMPLE_RATE_HZ / seq_step
+
+
+def fir_coefficients(cutoff_hz: float, rate_hz: float) -> np.ndarray:
+    cutoff_hz = max(1.0, min(cutoff_hz, rate_hz * 0.49))
+    norm = cutoff_hz / rate_hz
+    index = np.arange(FIR_TAPS, dtype=float)
+    offset = index - (FIR_TAPS - 1) / 2.0
+    window = 0.54 - 0.46 * np.cos(2.0 * math.pi * index / (FIR_TAPS - 1))
+    values = 2.0 * norm * np.sinc(2.0 * norm * offset) * window
+    return values / values.sum()
+
+
+def apply_fir(values: np.ndarray, coefficients: np.ndarray) -> np.ndarray:
+    if len(values) < 2:
+        return values
+    half = len(coefficients) // 2
+    padded = np.pad(values, (half, half), mode="edge")
+    return np.correlate(padded, coefficients, mode="valid")
 
 
 def find_serial_port(pattern: str | None) -> str | None:
@@ -515,6 +550,8 @@ class PlotWindow:
         self.plot_start_s = 0.0
         self.plot_y_min = -1000.0
         self.plot_y_max = 1000.0
+        self.fir_key: tuple[float, float] | None = None
+        self.fir_values = np.array([], dtype=float)
 
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         self.win = QtWidgets.QWidget()
@@ -550,13 +587,13 @@ class PlotWindow:
 
         button_row.addWidget(QtWidgets.QLabel("ADC +"))
         self.pos_box = QtWidgets.QComboBox()
-        self.fill_channel_box(self.pos_box, 4)
+        self.fill_channel_box(self.pos_box, DEFAULT_POS_CHANNEL)
         self.pos_box.currentIndexChanged.connect(self.change_channels)
         button_row.addWidget(self.pos_box)
 
         button_row.addWidget(QtWidgets.QLabel("ADC -"))
         self.neg_box = QtWidgets.QComboBox()
-        self.fill_channel_box(self.neg_box, 5)
+        self.fill_channel_box(self.neg_box, DEFAULT_NEG_CHANNEL)
         self.neg_box.currentIndexChanged.connect(self.change_channels)
         button_row.addWidget(self.neg_box)
 
@@ -567,6 +604,20 @@ class PlotWindow:
         self.gain_box.setCurrentIndex(DEFAULT_GAIN_CODE)
         self.gain_box.currentIndexChanged.connect(self.change_gain)
         button_row.addWidget(self.gain_box)
+
+        self.fir_enable = QtWidgets.QCheckBox("FIR")
+        self.fir_enable.stateChanged.connect(self.change_fir_filter)
+        button_row.addWidget(self.fir_enable)
+
+        button_row.addWidget(QtWidgets.QLabel("Cutoff (Hz)"))
+        self.fir_cutoff = QtWidgets.QDoubleSpinBox()
+        self.fir_cutoff.setRange(1.0, MAX_FIR_CUTOFF_HZ)
+        self.fir_cutoff.setDecimals(1)
+        self.fir_cutoff.setSingleStep(10.0)
+        self.fir_cutoff.setValue(DEFAULT_FIR_CUTOFF_HZ)
+        self.fir_cutoff.setEnabled(False)
+        self.fir_cutoff.valueChanged.connect(self.change_fir_filter)
+        button_row.addWidget(self.fir_cutoff)
 
         button_row.addStretch(1)
         layout.addLayout(button_row)
@@ -613,6 +664,16 @@ class PlotWindow:
         self.trigger_window_end.setValue(DEFAULT_CAPTURE_WINDOW_END_MS)
         self.trigger_window_end.valueChanged.connect(self.change_trigger_window)
         trigger_row.addWidget(self.trigger_window_end)
+
+        trigger_row.addWidget(QtWidgets.QLabel("Scale"))
+        self.uv_per_n = QtWidgets.QDoubleSpinBox()
+        self.uv_per_n.setRange(0.0000001, 1000000.0)
+        self.uv_per_n.setDecimals(7)
+        self.uv_per_n.setSingleStep(1.0)
+        self.uv_per_n.setValue(DEFAULT_UV_PER_N)
+        self.uv_per_n.setSuffix(" uV/N")
+        self.uv_per_n.valueChanged.connect(self.change_plot_scale)
+        trigger_row.addWidget(self.uv_per_n)
         trigger_row.addStretch(1)
         layout.addLayout(trigger_row)
 
@@ -638,7 +699,7 @@ class PlotWindow:
 
         self.trigger_plot = pg.PlotWidget(title=f"Capture {channel_text(self.pos_channel(), self.neg_channel())}")
         self.trigger_plot.showGrid(x=True, y=True, alpha=0.25)
-        self.trigger_plot.setLabel("left", "uV")
+        self.trigger_plot.setLabel("left", "N")
         self.trigger_plot.setLabel("bottom", "Time from pulse (s)")
         self.trigger_curve = self.trigger_plot.plot(pen=pg.mkPen("#f39c12", width=2))
         self.trigger_dot = self.trigger_plot.plot(
@@ -661,7 +722,7 @@ class PlotWindow:
 
         self.plot = pg.PlotWidget(title=f"Live {channel_text(self.pos_channel(), self.neg_channel())}")
         self.plot.showGrid(x=True, y=True, alpha=0.25)
-        self.plot.setLabel("left", "uV")
+        self.plot.setLabel("left", "N")
         self.plot.setLabel("bottom", "Last 5 s")
         self.plot.getViewBox().sigYRangeChanged.connect(self.plot_y_range_changed)
         self.curve = self.plot.plot(pen=pg.mkPen("#2980b9", width=2))
@@ -746,6 +807,17 @@ class PlotWindow:
     def sample_value(self, sample: Sample) -> float:
         return channel_value(sample.uv, self.pos_channel(), self.neg_channel())
 
+    def selected_values(self, samples: list[Sample]) -> np.ndarray:
+        pos = self.pos_channel()
+        neg = self.neg_channel()
+        if pos is None and neg is None:
+            return np.zeros(len(samples), dtype=float)
+        if pos is None:
+            return np.fromiter((sample.uv[neg] for sample in samples), dtype=float, count=len(samples))
+        if neg is None:
+            return np.fromiter((sample.uv[pos] for sample in samples), dtype=float, count=len(samples))
+        return np.fromiter((sample.uv[pos] - sample.uv[neg] for sample in samples), dtype=float, count=len(samples))
+
     def live_samples(self, samples: list[Sample]) -> list[Sample]:
         if not samples:
             return []
@@ -756,13 +828,29 @@ class PlotWindow:
             display.append(values[-1])
         return display
 
-    def display_values(self, samples: list[Sample]) -> list[float]:
-        return [self.sample_value(sample) for sample in samples]
+    def display_values(self, samples: list[Sample]) -> np.ndarray:
+        values = self.selected_values(samples)
+        if not self.fir_enable.isChecked():
+            return values
+        key = (float(self.fir_cutoff.value()), sample_rate(samples))
+        if self.fir_key != key:
+            self.fir_key = key
+            self.fir_values = fir_coefficients(*key)
+        return apply_fir(values, self.fir_values)
+
+    def plot_scale(self) -> float:
+        return float(self.uv_per_n.value())
+
+    def plot_threshold(self) -> float:
+        return self.trigger_threshold() / self.plot_scale()
+
+    def plot_values(self, samples: list[Sample]) -> np.ndarray:
+        return (self.display_values(samples) - self.zero_uv) / self.plot_scale()
 
     def average_value(self, samples: list[Sample]) -> float | None:
         if not samples:
             return None
-        return sum(self.sample_value(sample) for sample in samples) / len(samples)
+        return float(self.selected_values(samples).mean())
 
     def recent_average_value(self) -> float | None:
         if self.paused_samples is not None:
@@ -771,6 +859,16 @@ class PlotWindow:
             start_s = self.paused_samples[-1].timestamp_s - 1.0
             return self.average_value([sample for sample in self.paused_samples if sample.timestamp_s >= start_s])
         return self.average_value(self.samples.recent_snapshot(1.0))
+
+    def change_fir_filter(self, *_args) -> None:
+        enabled = self.fir_enable.isChecked()
+        self.fir_cutoff.setEnabled(enabled)
+        self.fir_key = None
+        self.trigger_draw_dirty = True
+        if enabled:
+            self.last_message = f"FIR cutoff {self.fir_cutoff.value():.1f} Hz"
+        else:
+            self.last_message = "FIR off"
 
     def trigger_value(self, sample: Sample) -> float:
         return self.sample_value(sample) - self.zero_uv
@@ -811,7 +909,7 @@ class PlotWindow:
         span = self.plot_y_max - self.plot_y_min
         if span <= 0.0:
             return
-        frac = (self.trigger_threshold() - self.plot_y_min) / span
+        frac = (self.plot_threshold() - self.plot_y_min) / span
         value = int(round(max(0.0, min(1.0, frac)) * TRIGGER_SLIDER_STEPS))
         if self.trigger_slider.value() == value:
             return
@@ -821,7 +919,7 @@ class PlotWindow:
 
     def slider_threshold(self, value: int) -> float:
         frac = value / float(TRIGGER_SLIDER_STEPS)
-        return self.plot_y_min + frac * (self.plot_y_max - self.plot_y_min)
+        return (self.plot_y_min + frac * (self.plot_y_max - self.plot_y_min)) * self.plot_scale()
 
     def plot_y_range_changed(self, *_args) -> None:
         y_min, y_max = self.plot.getViewBox().viewRange()[1]
@@ -865,8 +963,8 @@ class PlotWindow:
 
     def send_trigger_config(self) -> None:
         self.reader.set_trigger_command(self.trigger_command())
-        self.trigger_line.setValue(self.trigger_threshold())
-        self.trigger_level_line.setValue(self.trigger_threshold())
+        self.trigger_line.setValue(self.plot_threshold())
+        self.trigger_level_line.setValue(self.plot_threshold())
         self.update_pulse_line()
         self.trigger_draw_dirty = True
 
@@ -887,6 +985,13 @@ class PlotWindow:
     def change_trigger_window(self) -> None:
         self.reset_trigger_trace(arm_now=self.trigger_enable.isChecked())
         self.last_message = "capture window updated"
+
+    def change_plot_scale(self) -> None:
+        self.trigger_line.setValue(self.plot_threshold())
+        self.trigger_level_line.setValue(self.plot_threshold())
+        self.trigger_draw_dirty = True
+        self.set_slider_for_threshold()
+        self.last_message = "plot scale updated"
 
     def level_spin_changed(self) -> None:
         self.set_slider_for_threshold()
@@ -993,20 +1098,24 @@ class PlotWindow:
         if self.trigger_trace is None or not self.trigger_trace.samples:
             self.trigger_curve.setData([], [])
             self.trigger_dot.setData([], [])
-            self.trigger_level_line.setValue(self.trigger_threshold())
+            self.trigger_level_line.setValue(self.plot_threshold())
             self.update_pulse_line()
             self.trigger_draw_dirty = False
             return
         pulse_start_s = self.trigger_trace.pulse_start_seq / SAMPLE_RATE_HZ
-        xs = [sample.timestamp_s - pulse_start_s for sample in self.trigger_trace.samples]
-        ys = [self.trigger_value(sample) for sample in self.trigger_trace.samples]
+        xs = np.fromiter(
+            (sample.timestamp_s - pulse_start_s for sample in self.trigger_trace.samples),
+            dtype=float,
+            count=len(self.trigger_trace.samples),
+        )
+        ys = self.plot_values(self.trigger_trace.samples)
         cross_x = (self.trigger_trace.cross_seq - self.trigger_trace.pulse_start_seq) / SAMPLE_RATE_HZ
         self.trigger_curve.setData(xs, ys)
-        self.trigger_dot.setData([cross_x], [self.trigger_trace.cross_uv])
+        self.trigger_dot.setData([cross_x], [self.trigger_trace.cross_uv / self.plot_scale()])
         self.update_pulse_line()
         if self.trigger_range_dirty:
             left = self.trigger_x_left()
-            right = xs[-1] if xs else 0.0
+            right = xs[-1] if len(xs) else 0.0
             if right <= left:
                 right = left + 0.001
             self.trigger_plot.setXRange(left, right, padding=0.0)
@@ -1224,13 +1333,12 @@ class PlotWindow:
 
         start_s = samples[0].timestamp_s
         self.plot_start_s = start_s
-        xs = [sample.timestamp_s - start_s for sample in samples]
-        values = self.display_values(samples)
-        ys = [value - self.zero_uv for value in values]
+        xs = np.fromiter((sample.timestamp_s - start_s for sample in samples), dtype=float, count=len(samples))
+        ys = self.plot_values(samples)
         self.curve.setData(xs, ys)
-        self.plot.setXRange(0.0, max(WINDOW_SECONDS, xs[-1] if xs else WINDOW_SECONDS), padding=0.0)
-        self.trigger_line.setValue(self.trigger_threshold())
-        self.trigger_level_line.setValue(self.trigger_threshold())
+        self.plot.setXRange(0.0, max(WINDOW_SECONDS, xs[-1] if len(xs) else WINDOW_SECONDS), padding=0.0)
+        self.trigger_line.setValue(self.plot_threshold())
+        self.trigger_level_line.setValue(self.plot_threshold())
         self.draw_trigger_trace()
 
         latest = samples[-1]
