@@ -9,7 +9,7 @@ constexpr uint32_t kSerialBaud = 2000000;
 constexpr uint32_t kSpiClockHz = 24000000;
 constexpr uint8_t kWords = 10;
 constexpr uint8_t kFrameBytes = kWords * 3;
-constexpr uint8_t kChannels = 6;
+constexpr uint8_t kChannels = 8;
 constexpr uint32_t kSync = 0xA55AA55A;
 constexpr size_t kSamplesPerBlock = 64;
 constexpr size_t kRingSamples = 8192;
@@ -34,7 +34,7 @@ constexpr uint16_t kClockReg = 0x03;
 constexpr uint16_t kGain1Reg = 0x04;
 constexpr uint16_t kGain2Reg = 0x05;
 constexpr uint16_t kModeValue = 0x0110;
-constexpr uint16_t kClockValue32k = 0x3FC2;
+constexpr uint16_t kClockValue32k = 0xFFC2;
 constexpr uint8_t kDefaultGainCode = 7;
 constexpr uint8_t kMaxGainCode = 7;
 constexpr int32_t kAdcFullScale = 0x7FFFFF;
@@ -76,7 +76,7 @@ struct TriggerConfig {
   uint32_t width_us;
 };
 
-static_assert(sizeof(Block) == 1164);
+static_assert(sizeof(Block) == 1548);
 
 uint8_t tx[kFrameBytes] = {};
 uint8_t rx[kFrameBytes] = {};
@@ -116,7 +116,8 @@ uint16_t gain1Value(uint8_t gain_code) {
 }
 
 uint16_t gain2Value(uint8_t gain_code) {
-  return (static_cast<uint16_t>(gain_code) << 4) | gain_code;
+  return (static_cast<uint16_t>(gain_code) << 12) | (static_cast<uint16_t>(gain_code) << 8) |
+         (static_cast<uint16_t>(gain_code) << 4) | gain_code;
 }
 
 void putCommand(uint16_t command) {

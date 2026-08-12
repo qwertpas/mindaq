@@ -32,7 +32,7 @@ If this does not work on Windows, try replacing `python3` in the above commands 
 ## Buttons and Settings
 
 - Zeroing: Sets a baseline voltage as a 0 reading by subtracting the average voltage over the last 1 second.
-- ADC + and ADC -: select the ADC channels to read from. If two channels are selected, the difference is used (useful for load cells).
+- ADC + and ADC -: select the ADC channels to read from. Channels 6 and 7 are labeled Isense and Vsense. If two channels are selected, the difference is used (useful for load cells).
 - Gain: sets the ADC amplifier gain between 1x and 128x. Higher gain means more sensitivity, but could saturate the reading if the voltage is too high (e.g. very high force applied). Check for saturation by looking at the raw% values or whether the live plot is clipping.
 - Trigger level: set in microvolts using the numeric field or vertical slider.
 - Delay: this amount of time after the trigger threshold crossing, the GPIO pulse starts and is used as the reference for when `capture_time_s` = 0.
@@ -66,5 +66,5 @@ Capture timing columns:
 For debugging:
 - `seq`: sample sequence number.
 - `pos_channel`, `neg_channel`: selected ADC inputs.
-- `adc_N_uv`, `adc_N_raw`: per-channel microvolts and raw ADC counts, paired by channel.
+- `adc_N_uv`, `adc_N_raw`: per-channel microvolts and raw ADC counts, paired by channel. ADC 6 is Isense and ADC 7 is Vsense.
 - `gain_code`, `warn_flags`, `clip_flags`: stream metadata.

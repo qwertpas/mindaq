@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from glob import glob
 from os import name as os_name
+from pathlib import Path
 
 import numpy as np
 import serial
@@ -37,7 +38,8 @@ SAMPLE_RATE_HZ = 32_000.0
 DISPLAY_RATE_HZ = 1000.0
 DISPLAY_DECIMATE = int(SAMPLE_RATE_HZ / DISPLAY_RATE_HZ)
 MIN_DISPLAY_SAMPLES = 250
-CHANNELS = 6
+CHANNEL_NAMES = ("ADC 0", "ADC 1", "ADC 2", "ADC 3", "ADC 4", "ADC 5", "Isense", "Vsense")
+CHANNELS = len(CHANNEL_NAMES)
 SAMPLES_PER_BLOCK = 64
 RAW_BYTES = CHANNELS * 3
 SYNC = 0xA55AA55A
@@ -205,10 +207,10 @@ def channel_text(pos: int | None, neg: int | None) -> str:
     if pos is None and neg is None:
         return "None"
     if pos is None:
-        return f"ADC {neg}"
+        return CHANNEL_NAMES[neg]
     if neg is None:
-        return f"ADC {pos}"
-    return f"ADC {pos} - ADC {neg}"
+        return CHANNEL_NAMES[pos]
+    return f"{CHANNEL_NAMES[pos]} - {CHANNEL_NAMES[neg]}"
 
 
 def channel_value(values: tuple[float, ...], pos: int | None, neg: int | None) -> float:
@@ -552,6 +554,7 @@ class PlotWindow:
         self.plot_y_max = 1000.0
         self.fir_key: tuple[float, float] | None = None
         self.fir_values = np.array([], dtype=float)
+        self.settings = QtCore.QSettings("mindaq", "capture")
 
         self.app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
         self.win = QtWidgets.QWidget()
@@ -791,8 +794,8 @@ class PlotWindow:
 
     def fill_channel_box(self, box: QtWidgets.QComboBox, default: int | None) -> None:
         box.addItem("None", None)
-        for channel in range(CHANNELS):
-            box.addItem(str(channel), channel)
+        for channel, name in enumerate(CHANNEL_NAMES):
+            box.addItem(name, channel)
         index = box.findData(default)
         box.setCurrentIndex(index if index >= 0 else 0)
 
@@ -1164,9 +1167,17 @@ class PlotWindow:
             self.last_message = f"no {label} samples to save"
             return
         default_name = f"{label}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        path, _ = QtWidgets.QFileDialog.getSaveFileName(self.win, "Save CSV", default_name, "CSV Files (*.csv)")
+        last_dir = Path(str(self.settings.value("last_csv_dir", "")))
+        start_path = str(last_dir / default_name) if last_dir.is_dir() else default_name
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self.win,
+            "Save CSV",
+            start_path,
+            "CSV Files (*.csv)",
+        )
         if not path:
             return
+        self.settings.setValue("last_csv_dir", str(Path(path).parent))
 
         pos = self.pos_channel()
         neg = self.neg_channel()
